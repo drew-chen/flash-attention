@@ -1,0 +1,88 @@
+# ====================================================================
+# CUDA Build Artifacts & Intermediate Files
+# ====================================================================
+*.i
+*.ii
+*.gpu
+*.ptx
+*.cubin
+*.fatbin
+
+# ====================================================================
+# Compiled Objects and Binaries (C/C++)
+# ====================================================================
+# Objects
+*.o
+*.obj
+*.co
+*.cu.o
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# ====================================================================
+# Build Systems & Directories
+# ====================================================================
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+
+# Common build output folders
+[Bb]uild/
+[Cc]make-build-*/
+
+# ====================================================================
+# IDEs and Editors
+# ====================================================================
+# Visual Studio
+.vs/
+Debug/
+Release/
+x64/
+*.user
+*.suo
+*.sln.docstates
+
+# VS Code
+.vscode/
+!.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# clangd
+.cache/
+
+# CLion / JetBrains
+.idea/
+
+# Python
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+.venv

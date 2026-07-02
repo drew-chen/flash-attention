@@ -1,0 +1,38 @@
+CompileFlags:
+  Compiler: /usr/bin/clang++
+  Add:
+    - -std=c++20
+    - -Werror
+    - -Wall
+    - -Wextra
+    - -Wpedantic
+    - -Wshadow
+    - -Wconversion
+    - -Wsign-conversion
+    - -I/home/achen/c/flash-attention/.venv/lib/python3.12/site-packages/torch/include
+    - -I/home/achen/c/flash-attention/.venv/lib/python3.12/site-packages/torch/include/torch/csrc/api/include
+    - -I/home/achen/.local/share/uv/python/cpython-3.12.13-linux-x86_64-gnu/include/python3.12
+    - -I/usr/local/cuda/include
+    - -DTORCH_API_INCLUDE_EXTENSION_H
+    - -D__CUDA_NO_HALF_OPERATORS__
+    - -D__CUDA_NO_HALF_CONVERSIONS__
+    - -D__CUDA_NO_BFLOAT16_CONVERSIONS__
+    - -D__CUDA_NO_HALF2_OPERATORS__
+Diagnostics:
+  UnusedIncludes: Strict
+  ClangTidy:
+    Add:
+      - bugprone-*
+      - clang-analyzer-*
+      - performance-*
+      - readability-*
+    Remove:
+      - readability-identifier-length
+      - readability-magic-numbers
+---
+If:
+  PathMatch: .*\.cu
+CompileFlags:
+  Add:
+    - --cuda-path=/usr/local/cuda
+    - --cuda-gpu-arch=sm_89
