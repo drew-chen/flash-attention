@@ -8,10 +8,10 @@ This project is a small learning scaffold for understanding attention, tiled att
 ```python
 import flash_attention
 
-out = flash_attention.forward(q, k, v)
+out = flash_attention.forward_v0(q, k, v)
 ```
 
-`flash_attention.forward(...)` is the validated public entrypoint. It checks
+`flash_attention.forward_v0(...)` is the validated public V0 entrypoint. It checks
 that `q`, `k`, and `v` are CUDA `float32`, contiguous, and shaped `[B, H, N, D]`
 before dispatching to the CUDA implementation, which assumes that contract.
 
@@ -36,7 +36,7 @@ python -m pip install --upgrade pip setuptools wheel
 ### Install dependencies
 
 ```bash
-python -m pip install torch numpy jaxtyping
+python -m pip install torch numpy jaxtyping pytest
 ```
 
 The system `python3` on this machine is 3.14, so the repo uses a Python 3.12 virtual environment instead of the global interpreter.
@@ -76,31 +76,56 @@ VS Code's C++/CUDA diagnostics come from `clangd`. Run the same parser/checker
 outside the editor with:
 
 ```bash
-clangd --check=flash_cuda.cu --log=verbose
+clangd --check=v0/flash_cuda.cu --log=verbose
 ```
 
 The important line in the output is `All checks completed, 0 errors`. If the CLI
 output and VS Code disagree, reload VS Code and run `clangd: Restart language
 server`.
 
-The PyTorch/Tensor adapter lives in `flash.cpp`; `flash_cuda.cu` should stay as
+The V0 PyTorch/Tensor adapter lives in `v0/flash.cpp`; `v0/flash_cuda.cu` should stay as
 raw CUDA kernel/launcher code. That keeps `clangd` diagnostics for `.cu` files
 simple and avoids parsing PyTorch's tensor API through CUDA tooling.
 
-## Run the reference checks
+## How Python reaches CUDA
 
-Raw C comparison against the PyTorch reference:
+`flash_attention.forward_v0(...)` is exposed through a PyTorch C++/CUDA extension:
 
-```bash
-./build_raw_c.sh
-python test_raw_c_compare.py
-```
+1. Python calls `flash_attention.forward_v0(q, k, v)`.
+2. `v0/flash.cpp` exposes that function with pybind11 and validates the tensors.
+3. `v0/flash.cpp` passes raw tensor pointers to the CUDA launcher in `v0/flash_cuda.cu`.
+4. The CUDA launcher configures `grid`/`block` dimensions.
+5. `flash_forward_v0_kernel<<<grid, block>>>(...)` runs on the GPU.
 
-Build the CUDA extension scaffold:
+V0 kernels use `grid.z` to select a `(batch, head)` pair from contiguous
+`[B, H, ...]` tensors before operating on their local tile. Shared indexing
+utilities live alongside the helper kernels in `v0/flash_cuda_helpers.cuh`.
+
+The helper unit tests build a small test-only extension around reusable global
+kernels in `v0/flash_cuda_helpers.cuh`. They cover batched/headed
+transpose, scale, softmax, and matmul behavior independently of `forward_v0`.
+
+## Build and test V0
 
 ```bash
 python setup.py build_ext --inplace
-python test_cuda_extension.py
+python -m pytest -q tests/v0/test_forward_v0.py
+```
+
+`test_forward_v0.py` exercises only the public `flash_attention.forward_v0(...)`
+contract. It is intentionally skipped until V0's QK, softmax, and PV kernels are
+implemented.
+
+Run the helper unit tests:
+
+```bash
+python -m pytest -q tests/v0/test_cuda_helpers.py
+```
+
+For CUDA memory checking, run the full test suite through NVIDIA Compute Sanitizer:
+
+```bash
+compute-sanitizer --target-processes all python -m pytest -q
 ```
 
 `setup.py` defaults `TORCH_CUDA_ARCH_LIST` to `8.9`, which means CUDA compute
@@ -114,8 +139,10 @@ TORCH_CUDA_ARCH_LIST=<value> python setup.py build_ext --inplace
 The repository includes a minimal extension scaffold:
 
 - `setup.py`
-- `flash.cpp`
-- `flash_cuda.cu`
-- `test_cuda_extension.py`
+- `v0/flash.cpp`
+- `v0/flash_cuda.cu`
+- `v0/flash_cuda_helpers.cuh`
+- `tests/v0/test_forward_v0.py`
+- `tests/v0/test_cuda_helpers.py`
 
 That CUDA extension path is still intentionally incomplete, so build or runtime failures there should be treated as expected during development rather than environment setup failures.
