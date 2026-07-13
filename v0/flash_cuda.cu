@@ -1,10 +1,10 @@
 #include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
 
+#include "flash_cuda_helpers.cuh"
+#include "softmax.cuh"
 #include <cmath>
 #include <cstddef>
-#include "softmax.cuh"
-#include "flash_cuda_helpers.cuh"
 // scaled score func
 
 /*
@@ -33,8 +33,14 @@ Dimensions:
 Assumes q, k, v are CUDA float32 contiguous tensors with shape [B, H, N, D].
 Assumes N and D are both divisible by TILE_SZ
 */
-void naive_forward_v0_cuda_launch(const float *q, const float *k, const float *v, float *out,
-                                  int batch_size, int num_heads, int seq_len, int head_dim) {
+void naive_forward_v0_cuda_launch(const float *q,
+                                  const float *k,
+                                  const float *v,
+                                  float *out,
+                                  int batch_size,
+                                  int num_heads,
+                                  int seq_len,
+                                  int head_dim) {
     float *intermediate_score;
     // [B, H]
     const std::size_t batch_head_count =
@@ -51,7 +57,6 @@ void naive_forward_v0_cuda_launch(const float *q, const float *k, const float *v
     float *k_transpose;
     cudaMalloc(&k_transpose, batch_head_tensor_size * sizeof(float));
 
-
     dim3 block{TILE_SZ, TILE_SZ, 1};
     // Grid for [B, H, N, D] outputs: (D tiles, N tiles, B * H).
     dim3 qkv_grid{static_cast<unsigned int>(ceil_div(head_dim, TILE_SZ)),
@@ -67,8 +72,8 @@ void naive_forward_v0_cuda_launch(const float *q, const float *k, const float *v
     matmul<<<score_grid, block>>>(q, k_transpose, intermediate_score, num_heads, seq_len, head_dim,
                                   seq_len);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    C10_CUDA_CHECK(cudaMemcpy(scaled_score, intermediate_score, batch_head_score_size * sizeof(float),
-                              cudaMemcpyDeviceToDevice));
+    C10_CUDA_CHECK(cudaMemcpy(scaled_score, intermediate_score,
+                              batch_head_score_size * sizeof(float), cudaMemcpyDeviceToDevice));
     scale<<<score_grid, block>>>(scaled_score, num_heads, seq_len, seq_len,
                                  1.0F / static_cast<float>(std::sqrt(head_dim)));
     C10_CUDA_KERNEL_LAUNCH_CHECK();

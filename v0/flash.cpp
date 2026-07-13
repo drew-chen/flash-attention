@@ -2,9 +2,16 @@
 
 #include "../cuda_utils.h"
 
-void naive_forward_v0_cuda_launch(const float *q, const float *k, const float *v, float *out,
-                                  int batch_size, int num_heads, int seq_len, int head_dim);
-torch::Tensor flash_forward_v0_pytorch_cuda(const torch::Tensor &q, const torch::Tensor &k,
+void naive_forward_v0_cuda_launch(const float *q,
+                                  const float *k,
+                                  const float *v,
+                                  float *out,
+                                  int batch_size,
+                                  int num_heads,
+                                  int seq_len,
+                                  int head_dim);
+torch::Tensor flash_forward_v0_pytorch_cuda(const torch::Tensor &q,
+                                            const torch::Tensor &k,
                                             const torch::Tensor &v);
 
 // Validates the public contract for flash_attention.forward_v0(...):
@@ -26,7 +33,8 @@ torch::Tensor flash_forward_v0_assume_valid(torch::Tensor q, torch::Tensor k, to
     return flash_forward_v0_pytorch_cuda(q, k, v);
 }
 
-torch::Tensor flash_forward_v0_pytorch_cuda(const torch::Tensor &q, const torch::Tensor &k,
+torch::Tensor flash_forward_v0_pytorch_cuda(const torch::Tensor &q,
+                                            const torch::Tensor &k,
                                             const torch::Tensor &v) {
     // Assumes q, k, v already satisfy the validated contiguous [B, H, N, D] contract.
     auto out = torch::empty_like(q);
@@ -37,15 +45,16 @@ torch::Tensor flash_forward_v0_pytorch_cuda(const torch::Tensor &q, const torch:
     const int head_dim = static_cast<int>(q.size(3));
 
     naive_forward_v0_cuda_launch(q.const_data_ptr<float>(), k.const_data_ptr<float>(),
-                                 v.const_data_ptr<float>(), out.mutable_data_ptr<float>(), batch_size,
-                                 num_heads, seq_len, head_dim);
+                                 v.const_data_ptr<float>(), out.mutable_data_ptr<float>(),
+                                 batch_size, num_heads, seq_len, head_dim);
 
     return out;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward_v0", &flash_forward_v0,
-          "V0 FlashAttention forward. Expects CUDA float32 contiguous tensors of shape [B, H, N, D].");
+          "V0 FlashAttention forward. Expects CUDA float32 contiguous tensors of shape [B, H, N, "
+          "D].");
     m.def("forward_v0_assume_valid", &flash_forward_v0_assume_valid,
           "V0 FlashAttention forward assuming CUDA float32 contiguous [B, H, N, D] inputs.");
 }

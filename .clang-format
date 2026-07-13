@@ -4,3 +4,8 @@ ContinuationIndentWidth: 4
 TabWidth: 4
 UseTab: Never
 ColumnLimit: 100
+AlignAfterOpenBracket: Align
+BinPackParameters: OnePerLine
+# Keep a declaration's function name and first parameter together when they fit.
+PenaltyBreakOpenParenthesis: 100000
+PenaltyReturnTypeOnItsOwnLine: 100000

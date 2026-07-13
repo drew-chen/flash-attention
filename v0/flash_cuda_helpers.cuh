@@ -7,9 +7,7 @@
 constexpr int TILE_SZ{16};
 
 // Performs the floating division a/b then rounding up to the nearest int.
-constexpr int ceil_div(int a, int b) {
-    return (a / b) + static_cast<int>(a % b != 0);
-}
+constexpr int ceil_div(int a, int b) { return (a / b) + static_cast<int>(a % b != 0); }
 
 // Note: all the functions in this file assume the tile evently divides the input matrix.
 
@@ -19,7 +17,10 @@ Performs a tiled transpose from input[height, width] to output[width, height].
 This helper assumes both dimensions are multiples of TILE_SZ. Tests should make
 that assumption explicit until boundary handling is added.
 */
-__global__ void transpose(const float *input, float *output, int num_heads, int input_height,
+__global__ void transpose(const float *input,
+                          float *output,
+                          int num_heads,
+                          int input_height,
                           int input_width) {
     const auto [batch_idx, head_idx] = get_batch_head_index(num_heads);
     const int matrix_offset =
@@ -45,10 +46,9 @@ __global__ void scale(float *data, int num_heads, int data_width, int data_heigh
         batch_head_offset(batch_idx, head_idx, num_heads, data_height * data_width);
     const int r = static_cast<int>((blockIdx.y * TILE_SZ) + threadIdx.y);
     const int c = static_cast<int>((blockIdx.x * TILE_SZ) + threadIdx.x);
-    if (r >= data_height || c >= data_width){
+    if (r >= data_height || c >= data_width) {
         return;
     }
-        
 
     data[matrix_offset + (r * data_width) + c] *= factor;
 }
@@ -125,7 +125,7 @@ the results since summation is associative and commutative.
 
 Suppose the input matrices are the size of a block.
 A cuda block will load everything into shared memory.
-The advantage of this is re-use: 
+The advantage of this is re-use:
 an output element (i, j) and output element (i, j + 1) both require
 the same left matrix row i. Since it's in shared memory, we have effective caching.
 
@@ -140,7 +140,7 @@ How is this algorithm?
 To compute a block of output (TILE_SZ^2), we load N/TILE_SZ blocks.
 The number of flops is the same. Let T = TILE_SZ
 
-Arithmetic intensity = OP/B s 
+Arithmetic intensity = OP/B s
 = tile ops / tile memory loaded
 # there are N/T iterations, with total 2N multiplies and adds per element across all iterations
 # memory loaded is two blocks of block size * num blocks for each iteration
@@ -149,10 +149,15 @@ Arithmetic intensity = OP/B s
 = 0.25T FLOPs / B
 = 4 FLOPs/B
 
-This is a factor of T improvement! 
+This is a factor of T improvement!
 */
-__global__ void matmul(const float *left, const float *right, float *output, int num_heads,
-                       int left_height, int shared_dim, int right_width) {
+__global__ void matmul(const float *left,
+                       const float *right,
+                       float *output,
+                       int num_heads,
+                       int left_height,
+                       int shared_dim,
+                       int right_width) {
     const auto [batch_idx, head_idx] = get_batch_head_index(num_heads);
     left += batch_head_offset(batch_idx, head_idx, num_heads, left_height * shared_dim);
     right += batch_head_offset(batch_idx, head_idx, num_heads, shared_dim * right_width);
@@ -169,11 +174,12 @@ __global__ void matmul(const float *left, const float *right, float *output, int
     // divide left into one row of blocks and divide right into one column of blocks
     for (int i = 0; i < ceil_div(shared_dim, TILE_SZ); i++) {
         // load a tile of left's rows. Use a global row idx to choose the rows,
-        // and use local col idx to choose idx since we want load all cols of the rows after the iterations
-        const int itr_left_col = (i*TILE_SZ) + tx;
-        const int itr_right_row = (i*TILE_SZ) + ty;
-        const int left_idx = (output_r*shared_dim) + itr_left_col;
-        const int right_idx = (itr_right_row*right_width) + output_c;
+        // and use local col idx to choose idx since we want load all cols of the rows after the
+        // iterations
+        const int itr_left_col = (i * TILE_SZ) + tx;
+        const int itr_right_row = (i * TILE_SZ) + ty;
+        const int left_idx = (output_r * shared_dim) + itr_left_col;
+        const int right_idx = (itr_right_row * right_width) + output_c;
         if (output_r < left_height && itr_left_col < shared_dim) {
             left_tile[threadIdx.y][threadIdx.x] = left[left_idx];
         } else {
@@ -187,11 +193,11 @@ __global__ void matmul(const float *left, const float *right, float *output, int
         }
         __syncthreads();
         for (int j = 0; j < TILE_SZ; j++) {
-            dot_prod += left_tile[threadIdx.y][j]*right_tile[j][threadIdx.x];
+            dot_prod += left_tile[threadIdx.y][j] * right_tile[j][threadIdx.x];
         }
     }
-    if (output_r >= left_height || output_c >= right_width){
+    if (output_r >= left_height || output_c >= right_width) {
         return;
     }
-    output[(output_r*right_width) + output_c] = dot_prod;
+    output[(output_r * right_width) + output_c] = dot_prod;
 }
