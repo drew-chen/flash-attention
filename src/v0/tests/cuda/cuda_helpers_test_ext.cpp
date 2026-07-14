@@ -37,9 +37,6 @@ torch::Tensor transpose_cuda(const torch::Tensor &input) {
     const auto num_heads = static_cast<int>(input.size(1));
     const auto input_height = static_cast<int>(input.size(2));
     const auto input_width = static_cast<int>(input.size(3));
-    TORCH_CHECK(input_width % 16 == 0, "input width must be divisible by 16");
-    TORCH_CHECK(input_height % 16 == 0, "input height must be divisible by 16");
-
     auto output =
         torch::empty({input.size(0), input.size(1), input.size(3), input.size(2)}, input.options());
     transpose_cuda_launch(input.const_data_ptr<float>(), output.mutable_data_ptr<float>(),

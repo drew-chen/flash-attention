@@ -1,7 +1,7 @@
 #include <c10/cuda/CUDAException.h>
 
-#include "../../../v0/flash_cuda_helpers.cuh"
-#include "../../../v0/softmax.cuh"
+#include "../../flash_cuda_helpers.cuh"
+#include "../../softmax.cuh"
 
 int ceil_div_host(int a, int b) { return ceil_div(a, b); }
 

@@ -8,11 +8,6 @@ from torch.utils.cpp_extension import load
 ROOT = Path(__file__).resolve().parent
 TILE_SIZE = 16
 
-# Helpers use [batch, heads, ...] layouts. Transpose currently covers only
-# dimensions divisible by TILE_SIZE.
-# Scale includes non-divisible dimensions because it has boundary checks.
-
-
 def assert_close_with_values(actual, expected, **kwargs):
     try:
         torch.testing.assert_close(actual, expected, **kwargs)
@@ -69,6 +64,9 @@ def test_ceil_div_host(cuda_helpers, dividend, divisor, expected):
         pytest.param(2, 1, 32, 16, id="multiple-batches-single-head"),
         pytest.param(2, 3, 32, 32, id="multiple-batches-multiple-heads"),
         pytest.param(3, 2, 64, 48, id="rectangular-multiple-batches-and-heads"),
+        pytest.param(2, 3, 15, 16, id="partial-height"),
+        pytest.param(2, 3, 16, 15, id="partial-width"),
+        pytest.param(2, 3, 17, 31, id="partial-height-and-width"),
     ],
 )
 def test_transpose(cuda_helpers, batch_size, num_heads, height, width):
@@ -80,21 +78,6 @@ def test_transpose(cuda_helpers, batch_size, num_heads, height, width):
     expected = x.transpose(-1, -2).contiguous()
 
     assert_close_with_values(actual, expected, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize(
-    "height,width",
-    [
-        pytest.param(15, 16, id="height-oob"),
-        pytest.param(16, 15, id="width-oob"),
-        pytest.param(17, 31, id="both-oob"),
-    ],
-)
-def test_transpose_rejects_partial_tiles(cuda_helpers, cuda_rng, height, width):
-    x = torch.randn((2, 3, height, width), device="cuda", dtype=torch.float32, generator=cuda_rng)
-
-    with pytest.raises(RuntimeError, match="divisible by 16"):
-        cuda_helpers.transpose_cuda(x)
 
 
 @pytest.mark.parametrize(
@@ -118,6 +101,7 @@ def test_scale(cuda_helpers, cuda_rng, batch_size, num_heads, height, width):
 @pytest.mark.parametrize("batch_size,num_heads,rows,width", [
     pytest.param(1, 1, 5, 16, id="single-batch-single-head"),
     pytest.param(2, 3, 5, 16, id="multiple-batches-and-heads"),
+    pytest.param(2, 3, 5, 17, id="partial-width"),
     pytest.param(1, 1, 5, 4096, id="row-wider-than-a-block"),
 ])
 def test_softmax(cuda_helpers, cuda_rng, batch_size, num_heads, rows, width):
@@ -125,8 +109,9 @@ def test_softmax(cuda_helpers, cuda_rng, batch_size, num_heads, rows, width):
         [
             torch.randn((batch_size, num_heads, rows - 1, width), device="cuda", dtype=torch.float32,
                         generator=cuda_rng),
-            torch.tensor([[[[1000.0, 1001.0, 999.0, 998.0] * (width // 4)]]], device="cuda").expand(
-                batch_size, num_heads, 1, width),
+            torch.arange(width, device="cuda", dtype=torch.float32)
+            .reshape(1, 1, 1, width)
+            .expand(batch_size, num_heads, 1, width),
         ],
         dim=2,
     )

@@ -9,13 +9,8 @@ constexpr int TILE_SZ{16};
 // Performs the floating division a/b then rounding up to the nearest int.
 constexpr int ceil_div(int a, int b) { return (a / b) + static_cast<int>(a % b != 0); }
 
-// Note: all the functions in this file assume the tile evently divides the input matrix.
-
 /**
 Performs a tiled transpose from input[height, width] to output[width, height].
-
-This helper assumes both dimensions are multiples of TILE_SZ. Tests should make
-that assumption explicit until boundary handling is added.
 */
 __global__ void transpose(const float *input,
                           float *output,
@@ -27,17 +22,19 @@ __global__ void transpose(const float *input,
         batch_head_offset(batch_idx, head_idx, num_heads, input_height * input_width);
     const int input_r = static_cast<int>((blockIdx.y * TILE_SZ) + threadIdx.y);
     const int input_c = static_cast<int>((blockIdx.x * TILE_SZ) + threadIdx.x);
-    if (input_r >= input_height || input_c >= input_width) {
-        return;
-    }
 
     __shared__ float tile[TILE_SZ][TILE_SZ + 1];
-    tile[threadIdx.y][threadIdx.x] = input[matrix_offset + (input_r * input_width) + input_c];
+    if (input_r < input_height && input_c < input_width) {
+        tile[threadIdx.y][threadIdx.x] = input[matrix_offset + (input_r * input_width) + input_c];
+    }
     __syncthreads();
 
     const int output_c = static_cast<int>((blockIdx.y * TILE_SZ) + threadIdx.x);
     const int output_r = static_cast<int>((blockIdx.x * TILE_SZ) + threadIdx.y);
-    output[matrix_offset + (output_r * input_height) + output_c] = tile[threadIdx.x][threadIdx.y];
+    if (output_c < input_height && output_r < input_width) {
+
+        output[matrix_offset + (output_r * input_height) + output_c] = tile[threadIdx.x][threadIdx.y];
+    }
 }
 
 __global__ void scale(float *data, int num_heads, int data_width, int data_height, float factor) {

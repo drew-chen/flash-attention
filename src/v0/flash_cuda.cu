@@ -5,7 +5,6 @@
 #include "softmax.cuh"
 #include <cmath>
 #include <cstddef>
-// scaled score func
 
 /*
 A very naive attention calculation (not flash attention).
@@ -31,7 +30,6 @@ Dimensions:
 
 
 Assumes q, k, v are CUDA float32 contiguous tensors with shape [B, H, N, D].
-Assumes N and D are both divisible by TILE_SZ
 */
 void naive_forward_v0_cuda_launch(const float *q,
                                   const float *k,

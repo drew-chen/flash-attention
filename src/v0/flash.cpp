@@ -29,7 +29,7 @@ torch::Tensor flash_forward_v0(torch::Tensor q, torch::Tensor k, torch::Tensor v
     return flash_forward_v0_pytorch_cuda(q, k, v);
 }
 
-torch::Tensor flash_forward_v0_assume_valid(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
+torch::Tensor flash_forward_v0_unchecked(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
     return flash_forward_v0_pytorch_cuda(q, k, v);
 }
 
@@ -55,6 +55,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward_v0", &flash_forward_v0,
           "V0 FlashAttention forward. Expects CUDA float32 contiguous tensors of shape [B, H, N, "
           "D].");
-    m.def("forward_v0_assume_valid", &flash_forward_v0_assume_valid,
-          "V0 FlashAttention forward assuming CUDA float32 contiguous [B, H, N, D] inputs.");
+    m.def("forward_v0_unchecked", &flash_forward_v0_unchecked,
+          "V0 FlashAttention forward without input validation. "
+          "Requires CUDA float32 contiguous [B, H, N, D] inputs.");
 }
