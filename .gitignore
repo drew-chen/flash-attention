@@ -56,23 +56,6 @@ compile_commands.json
 # ====================================================================
 # IDEs and Editors
 # ====================================================================
-# Visual Studio
-.vs/
-Debug/
-Release/
-x64/
-*.user
-*.suo
-*.sln.docstates
-
-# VS Code
-.vscode/
-!.vscode/
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
-!.vscode/extensions.json
-
 # clangd
 .cache/
 
@@ -80,8 +63,7 @@ x64/
 .idea/
 
 # Python
-
-# Byte-compiled / optimized / DLL files
+.pytest_cache
 __pycache__/
 *.py[codz]
 *$py.class
