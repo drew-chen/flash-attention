@@ -1,148 +1,136 @@
-# FlashAttention Learning Project
-TODO: extend to flash attention 2
+# FlashAttention
 
-This project is a small learning scaffold for understanding attention, tiled attention, and how a future CUDA extension can connect into PyTorch.
+This is a project meant for learning. The cuda code is handwritten but the surrounding utils such as the binding to pytorch is not.
 
-## Python usage
 
-```python
-import flash_attention
+## Optimization worklog
 
-out = flash_attention.forward_v0(q, k, v)
-```
+Use the same primary shape for every iteration; record the small shape suite only
+when a change is worth keeping. Latency is the decision metric; the other values
+help explain whether the kernel is compute- or memory-bound.
 
-`flash_attention.forward_v0(...)` is the validated public V0 entrypoint. It checks
-that `q`, `k`, and `v` are CUDA `float32`, contiguous, and shaped `[B, H, N, D]`
-before dispatching to the CUDA implementation, which assumes that contract.
+**Primary shape:** `B=__, H=__, S=__, D=__, dtype=__, causal=__`
+
+| Iteration | Change | Latency (µs) | Δ vs. baseline | TFLOP/s | GB/s | AI (FLOP/B) | Conclusion |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 0 | Baseline |  | — |  |  |  |  |
+
+| Iteration | S=512 latency | S=2K latency | S=8K latency | S=32K latency | Regression? |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 0 (baseline) |  |  |  |  | No |
+
+Keep two plots alongside this log:
+
+- **Latency by sequence length:** one line per retained iteration.
+- **Roofline:** baseline and current-best kernel, with points labeled by sequence length.
 
 ## Setup
 
-Use a local virtual environment. This repo was validated in a CUDA-capable environment on July 2, 2026 with:
-
-- Python 3.12.13 in `.venv`
-- PyTorch `2.12.1+cu130`
-- local `nvcc` `13.2`
-- NVIDIA GeForce RTX 4080
-
-### Create a virtual environment
+Create and activate a Python 3.12 virtual environment:
 
 ```bash
 uv venv --python 3.12 .venv
 source .venv/bin/activate
-python -m ensurepip --upgrade
 python -m pip install --upgrade pip setuptools wheel
-```
-
-### Install dependencies
-
-```bash
 python -m pip install torch numpy jaxtyping pytest
 ```
 
-The system `python3` on this machine is 3.14, so the repo uses a Python 3.12 virtual environment instead of the global interpreter.
-
-## Verify the environment
-
-```bash
-python -c "import torch; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.is_available())"
-```
-
-Expected on this machine:
-
-- PyTorch reports `2.12.1+cu130`
-- `torch.version.cuda` reports `13.0`
-- `torch.cuda.is_available()` reports `True`
-
-## VS Code
-
-This repo includes committed workspace settings in `.vscode/` for:
-
-- the repo-local Python interpreter at `.venv/bin/python`
-- `clangd`-based resolution of PyTorch C++ extension headers such as `torch/extension.h`
-- CUDA headers from `/usr/local/cuda/include`
-
-Install these VS Code extensions for this workspace:
-
-- `ms-python.python`
-- `ms-python.vscode-pylance`
-- `llvm-vs-code-extensions.vscode-clangd`
-- `xaver.clang-format`
-
-If VS Code still shows stale diagnostics after opening the repo, reload the window and run `clangd: Restart language server`.
-
-### Reproduce VS Code C++/CUDA diagnostics from the CLI
-
-VS Code's C++/CUDA diagnostics come from `clangd`. Run the same parser/checker
-outside the editor with:
-
-```bash
-clangd --check=v0/flash_cuda.cu --log=verbose
-```
-
-The important line in the output is `All checks completed, 0 errors`. If the CLI
-output and VS Code disagree, reload VS Code and run `clangd: Restart language
-server`.
-
-The V0 PyTorch/Tensor adapter lives in `v0/flash.cpp`; `v0/flash_cuda.cu` should stay as
-raw CUDA kernel/launcher code. That keeps `clangd` diagnostics for `.cu` files
-simple and avoids parsing PyTorch's tensor API through CUDA tooling.
-
-## How Python reaches CUDA
-
-`flash_attention.forward_v0(...)` is exposed through a PyTorch C++/CUDA extension:
-
-1. Python calls `flash_attention.forward_v0(q, k, v)`.
-2. `v0/flash.cpp` exposes that function with pybind11 and validates the tensors.
-3. `v0/flash.cpp` passes raw tensor pointers to the CUDA launcher in `v0/flash_cuda.cu`.
-4. The CUDA launcher configures `grid`/`block` dimensions.
-5. `flash_forward_v0_kernel<<<grid, block>>>(...)` runs on the GPU.
-
-V0 kernels use `grid.z` to select a `(batch, head)` pair from contiguous
-`[B, H, ...]` tensors before operating on their local tile. Shared indexing
-utilities live alongside the helper kernels in `v0/flash_cuda_helpers.cuh`.
-
-The helper unit tests build a small test-only extension around reusable global
-kernels in `v0/flash_cuda_helpers.cuh`. They cover batched/headed
-transpose, scale, softmax, and matmul behavior independently of `forward_v0`.
-
-## Build and test V0
+Build the CUDA extension:
 
 ```bash
 python setup.py build_ext --inplace
-python -m pytest -q tests/v0/test_forward_v0.py
 ```
 
-`test_forward_v0.py` exercises only the public `flash_attention.forward_v0(...)`
-contract. It is intentionally skipped until V0's QK, softmax, and PV kernels are
-implemented.
+Run this once initially and again after changing C++ or CUDA sources/headers in
+`src/` (including shared CUDA utilities). Python-only edits—such as the
+baseline, benchmark, tests, or README—do not require rebuilding.
 
-Run the helper unit tests:
-
-```bash
-python -m pytest -q tests/v0/test_cuda_helpers.py
-```
-
-For CUDA memory checking, run the full test suite through NVIDIA Compute Sanitizer:
-
-```bash
-compute-sanitizer --target-processes all python -m pytest -q
-```
-
-`setup.py` defaults `TORCH_CUDA_ARCH_LIST` to `8.9`, which means CUDA compute
-capability 8.9 / `sm_89`. That targets Ada Lovelace GPUs such as the RTX 4080.
-Override it for a different GPU with:
+The extension requires a CUDA-capable PyTorch installation and a compatible CUDA toolkit. To target a different GPU architecture, set `TORCH_CUDA_ARCH_LIST` when building:
 
 ```bash
 TORCH_CUDA_ARCH_LIST=<value> python setup.py build_ext --inplace
 ```
 
-The repository includes a minimal extension scaffold:
+## Python usage
 
-- `setup.py`
-- `v0/flash.cpp`
-- `v0/flash_cuda.cu`
-- `v0/flash_cuda_helpers.cuh`
-- `tests/v0/test_forward_v0.py`
-- `tests/v0/test_cuda_helpers.py`
+```python
+import torch
+import flash_attention
 
-That CUDA extension path is still intentionally incomplete, so build or runtime failures there should be treated as expected during development rather than environment setup failures.
+q = torch.randn(2, 3, 32, 16, device="cuda")
+k = torch.randn_like(q)
+v = torch.randn_like(q)
+
+out = flash_attention.forward_v0(q, k, v)
+```
+
+`forward_v0` accepts contiguous CUDA `float32` tensors with shape `[B, H, N, D]`.
+
+The explicit PyTorch correctness reference is available as `src.baseline.forward`:
+
+```python
+from src.baseline import forward as baseline_forward
+
+out = baseline_forward(q, k, v)
+```
+
+## Tests
+
+Run the full test suite:
+
+```bash
+python -m pytest -q
+```
+
+Run individual test groups:
+
+```bash
+python -m pytest -q src/baseline/tests
+python -m pytest -q src/v0/tests/test_cuda_helpers.py
+python -m pytest -q src/v0/tests/test_forward_v0.py
+```
+
+Run CUDA memory checks:
+
+```bash
+compute-sanitizer --target-processes all python -m pytest -q
+```
+
+## Benchmarks
+
+Build the extension, then run every registered implementation with GPU-side CUDA
+events:
+
+```bash
+python benchmark/benchmark.py
+```
+
+The default suite is `S=512, 1024, 2048` at `B=2, H=8, D=64`, with 25 warm-up
+calls and 100 timed repetitions per implementation and shape. It currently runs
+`baseline` and `v0`; future registered implementations are included
+automatically.
+
+The output is a Markdown table like this (values depend on the GPU):
+
+```text
+GPU timing: B=2, H=8, D=64, dtype=float32, warmup=25, repetitions=100
+| Implementation | Sequence length | Latency (us) | Effective TFLOP/s |
+| :------------- | --------------: | -----------: | ----------------: |
+| baseline       |             512 |        <...> |             <...> |
+| v0             |             512 |        <...> |             <...> |
+| baseline       |            1024 |        <...> |             <...> |
+| v0             |            1024 |        <...> |             <...> |
+```
+
+### Choose a shape or implementation
+
+To override the default shape suite, timed repetitions, or implementation set:
+
+```bash
+python benchmark/benchmark.py --seq-lens 2048 --repetitions 100
+python benchmark/benchmark.py --implementations baseline
+python benchmark/benchmark.py --implementations v0
+```
+
+The reported TFLOP/s counts the two matrix multiplications only; latency is the
+primary comparison metric.
