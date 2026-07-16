@@ -1,51 +1,38 @@
 # FlashAttention
 
-This is a project meant for learning. The cuda code is handwritten but the surrounding utils such as the binding to pytorch is not.
-
+Learning project for a handwritten CUDA FlashAttention implementation. PyTorch
+provides the Python binding and correctness reference.
 
 ## Optimization worklog
 
-Use the same primary shape for every iteration; record the small shape suite only
-when a change is worth keeping. Latency is the decision metric; the other values
-help explain whether the kernel is compute- or memory-bound.
+**Primary shape:** `B=2, H=8, S=2048, D=64, dtype=float32, causal=false`
 
-**Primary shape:** `B=__, H=__, S=__, D=__, dtype=__, causal=__`
+| Version | Latency (µs) | Δ vs. baseline | FLOPs per second (TFLOP/s)* | DRAM bandwidth (GB/s)* | Arithmetic Intensity (FLOP/byte)* | Conclusion |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Baseline | 2869.55 | — | 9.202 | 552.211 | 16.664 | Reference measurement |
+| V0 | 13752.51 | +379.3% | 2.140 | 354.121 | 6.044 | Draft non-flash attention implementation is worse than baseline |
 
-| Iteration | Change | Latency (µs) | Δ vs. baseline | TFLOP/s | GB/s | AI (FLOP/B) | Conclusion |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| 0 | Baseline |  | — |  |  |  |  |
-
-| Iteration | S=512 latency | S=2K latency | S=8K latency | S=32K latency | Regression? |
-| --- | ---: | ---: | ---: | ---: | --- |
-| 0 (baseline) |  |  |  |  | No |
-
-Keep two plots alongside this log:
-
-- **Latency by sequence length:** one line per retained iteration.
-- **Roofline:** baseline and current-best kernel, with points labeled by sequence length.
+\* See the [profiling appendix](#appendix-profiling-unfused-implementations).
 
 ## Setup
 
-Create and activate a Python 3.12 virtual environment:
+Requires Python 3.12, a CUDA-enabled PyTorch build, a compatible CUDA toolkit
+with `nvcc`, and a CUDA-compatible C++20 compiler. Create an environment and
+install the Python dependencies:
 
 ```bash
 uv venv --python 3.12 .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install torch numpy jaxtyping pytest
+python -m pip install -r requirements.txt
 ```
 
-Build the CUDA extension:
+Build the extension (repeat after changing C++ or CUDA files):
 
 ```bash
 python setup.py build_ext --inplace
 ```
 
-Run this once initially and again after changing C++ or CUDA sources/headers in
-`src/` (including shared CUDA utilities). Python-only edits—such as the
-baseline, benchmark, tests, or README—do not require rebuilding.
-
-The extension requires a CUDA-capable PyTorch installation and a compatible CUDA toolkit. To target a different GPU architecture, set `TORCH_CUDA_ARCH_LIST` when building:
+To target a different GPU architecture:
 
 ```bash
 TORCH_CUDA_ARCH_LIST=<value> python setup.py build_ext --inplace
@@ -64,33 +51,16 @@ v = torch.randn_like(q)
 out = flash_attention.forward_v0(q, k, v)
 ```
 
-`forward_v0` accepts contiguous CUDA `float32` tensors with shape `[B, H, N, D]`.
-
-The explicit PyTorch correctness reference is available as `src.baseline.forward`:
-
-```python
-from src.baseline import forward as baseline_forward
-
-out = baseline_forward(q, k, v)
-```
+`forward_v0` accepts contiguous CUDA `float32` tensors shaped `[B, H, N, D]`.
+Use `src.baseline.forward` as the PyTorch correctness reference.
 
 ## Tests
-
-Run the full test suite:
 
 ```bash
 python -m pytest -q
 ```
 
-Run individual test groups:
-
-```bash
-python -m pytest -q src/baseline/tests
-python -m pytest -q src/v0/tests/test_cuda_helpers.py
-python -m pytest -q src/v0/tests/test_forward_v0.py
-```
-
-Run CUDA memory checks:
+For CUDA memory checks:
 
 ```bash
 compute-sanitizer --target-processes all python -m pytest -q
@@ -98,39 +68,59 @@ compute-sanitizer --target-processes all python -m pytest -q
 
 ## Benchmarks
 
-Build the extension, then run every registered implementation with GPU-side CUDA
-events:
-
 ```bash
-python benchmark/benchmark.py
+python benchmark.py
 ```
 
-The default suite is `S=512, 1024, 2048` at `B=2, H=8, D=64`, with 25 warm-up
-calls and 100 timed repetitions per implementation and shape. It currently runs
-`baseline` and `v0`; future registered implementations are included
-automatically.
+The fixed suite covers `S=512, 1024, 2048` at `B=2, H=8, D=64`, with 25
+warmups and 100 timed calls.
 
-The output is a Markdown table like this (values depend on the GPU):
+## Appendix: profiling unfused implementations
+
+Set `implementation` to `v0` or `baseline`:
+
+```bash
+implementation=v0
+```
+
+Collect duration and DRAM traffic for one complete NVTX-marked forward range:
+
+```bash
+sudo /usr/local/cuda/bin/ncu \
+  --replay-mode range \
+  --nvtx \
+  --nvtx-include "flash_attention.${implementation}/" \
+  --metrics dram__bytes.sum,gpu__time_duration.sum \
+  --export "/tmp/flash_${implementation}_s2048_range" \
+  --force-overwrite \
+  python profile_cuda.py "$implementation"
+```
+
+Collect the FP32 instruction counts for each kernel in that range:
+
+```bash
+sudo /usr/local/cuda/bin/ncu \
+  --replay-mode kernel \
+  --nvtx \
+  --nvtx-include "flash_attention.${implementation}/" \
+  --metrics smsp__sass_thread_inst_executed_op_fadd_pred_on.sum,smsp__sass_thread_inst_executed_op_fmul_pred_on.sum,smsp__sass_thread_inst_executed_op_ffma_pred_on.sum \
+  --export "/tmp/flash_${implementation}_s2048_kernels" \
+  --force-overwrite \
+  python profile_cuda.py "$implementation"
+```
+
+Combine the reports as follows:
 
 ```text
-GPU timing: B=2, H=8, D=64, dtype=float32, warmup=25, repetitions=100
-| Implementation | Sequence length | Latency (us) | Effective TFLOP/s |
-| :------------- | --------------: | -----------: | ----------------: |
-| baseline       |             512 |        <...> |             <...> |
-| v0             |             512 |        <...> |             <...> |
-| baseline       |            1024 |        <...> |             <...> |
-| v0             |            1024 |        <...> |             <...> |
+FP32 operations = Σ(FADD + FMUL + 2 × FFMA)
+FLOPs per second = FP32 operations / range duration
+DRAM bandwidth = range DRAM bytes / range duration
+Arithmetic intensity = FP32 operations / range DRAM bytes
 ```
 
-### Choose a shape or implementation
-
-To override the default shape suite, timed repetitions, or implementation set:
-
-```bash
-python benchmark/benchmark.py --seq-lens 2048 --repetitions 100
-python benchmark/benchmark.py --implementations baseline
-python benchmark/benchmark.py --implementations v0
-```
-
-The reported TFLOP/s counts the two matrix multiplications only; latency is the
-primary comparison metric.
+FP32 operations (`FADD + FMUL + 2 × FFMA`) are summed across each
+implementation's kernel profiles; duration and DRAM bytes cover its complete
+NVTX-marked forward range. Nsight cannot collect FP32 instruction counts for a
+multi-kernel range, which is why the kernel and range reports are collected
+separately. Special-function operations such as `exp` are not included in the
+FP32 operation count.

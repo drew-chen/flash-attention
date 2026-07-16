@@ -1,0 +1,7 @@
+# Runtime and CUDA-extension build dependencies
+torch
+jaxtyping
+setuptools
+
+# Tests
+pytest
