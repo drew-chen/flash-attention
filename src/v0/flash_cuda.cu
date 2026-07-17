@@ -25,11 +25,13 @@ Dimensions:
 
 - (batch_size) B: batch size. How many independent sequences are processed together.
 - (num_heads) H: number of attention heads per sequence.
-- (seq_len) N: sequence length. How many token positions each head attends over.
+- (seq_len) N: self-attention sequence length. In general attention, Q has M rows
+  and K/V have N rows; this implementation is specialized to M = N = seq_len.
 - (head_dim) D: head dimension. Size of the per-token vector inside one head.
 
 
-Assumes q, k, v are CUDA float32 contiguous tensors with shape [B, H, N, D].
+Assumes self-attention: q, k, v are CUDA float32 contiguous tensors with the same
+shape [B, H, N, D], so M = N = seq_len.
 */
 void naive_forward_v0_cuda_launch(const float *q,
                                   const float *k,
@@ -46,7 +48,8 @@ void naive_forward_v0_cuda_launch(const float *q,
     // [B, H, N, D] for q, k, v, out, and k_transpose (whose per-head view is [D, N]).
     const std::size_t batch_head_tensor_size =
         batch_head_count * static_cast<std::size_t>(seq_len) * static_cast<std::size_t>(head_dim);
-    // [B, H, N, N] for QK^T scores and row-wise softmax probabilities.
+    // [B, H, M, N] for QK^T scores and row-wise softmax probabilities;
+    // self-attention specializes this to [B, H, N, N].
     const std::size_t batch_head_score_size =
         batch_head_count * static_cast<std::size_t>(seq_len) * static_cast<std::size_t>(seq_len);
     cudaMalloc(&intermediate_score, batch_head_score_size * sizeof(float));

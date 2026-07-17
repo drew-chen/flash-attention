@@ -5,6 +5,7 @@ from typing import TypeAlias
 import torch
 from jaxtyping import Float
 
-# The current project scope uses the same FP32 [B, H, N, D] shape for Q, K, V,
-# and the output. Jaxtyping labels connect matching dimensions across arguments.
+# The general formulation uses Q [B, H, M, D] and K/V [B, H, N, D]. The current
+# project implements self-attention only, so M = N and Q, K, V, and O share this
+# FP32 [B, H, N, D] shape. Jaxtyping labels connect matching dimensions.
 AttentionTensor: TypeAlias = Float[torch.Tensor, "batch heads sequence head_dim"]

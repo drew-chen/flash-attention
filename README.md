@@ -1,16 +1,17 @@
 # FlashAttention
 
-Learning project for a handwritten CUDA FlashAttention implementation. PyTorch
+Pedagogical project for a handwritten CUDA FlashAttention implementation. PyTorch
 provides the Python binding and correctness reference.
 
 ## Optimization worklog
 
-**Primary shape:** `B=2, H=8, S=2048, D=64, dtype=float32, causal=false`
+**Primary shape:** `B=2, H=8, M=N=2048, D=64, dtype=float32, causal=false`
 
 | Version | Latency (µs) | Δ vs. baseline | FLOPs per second (TFLOP/s)* | DRAM bandwidth (GB/s)* | Arithmetic Intensity (FLOP/byte)* | Conclusion |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | Baseline | 2869.55 | — | 9.202 | 552.211 | 16.664 | Reference measurement |
 | V0 | 13752.51 | +379.3% | 2.140 | 354.121 | 6.044 | Draft non-flash attention implementation is worse than baseline |
+| V1 |  ---: | ---: | ---: | ---: | ---:  | Fused kernel, online softmax, skipping tranpose |
 
 \* See the [profiling appendix](#appendix-profiling-unfused-implementations).
 
@@ -51,7 +52,9 @@ v = torch.randn_like(q)
 out = flash_attention.forward_v0(q, k, v)
 ```
 
-`forward_v0` accepts contiguous CUDA `float32` tensors shaped `[B, H, N, D]`.
+`forward_v0` implements self-attention only: it accepts contiguous CUDA `float32`
+Q, K, and V tensors, each shaped `[B, H, N, D]`, where the general attention
+dimensions satisfy `M = N`. Its output has the same shape.
 Use `src.baseline.forward` as the PyTorch correctness reference.
 
 ## Tests
@@ -72,7 +75,8 @@ compute-sanitizer --target-processes all python -m pytest -q
 python benchmark.py
 ```
 
-The fixed suite covers `S=512, 1024, 2048` at `B=2, H=8, D=64`, with 25
+The fixed suite covers self-attention shapes `M=N=512, 1024, 2048` at
+`B=2, H=8, D=64`, with 25
 warmups and 100 timed calls.
 
 ## Appendix: profiling unfused implementations

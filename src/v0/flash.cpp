@@ -15,7 +15,8 @@ torch::Tensor flash_forward_v0_pytorch_cuda(const torch::Tensor &q,
                                             const torch::Tensor &v);
 
 // Validates the public contract for flash_attention.forward_v0(...):
-// CUDA float32 contiguous tensors with shape [B, H, N, D].
+// CUDA float32 contiguous self-attention tensors with shape [B, H, N, D]
+// (the general attention dimensions are specialized to M = N).
 void validate_flash_inputs(const torch::Tensor &q, const torch::Tensor &k, const torch::Tensor &v) {
     check_cuda_float32_contiguous_dim(q, "q", 4);
     check_cuda_float32_contiguous_dim(k, "k", 4);
@@ -36,7 +37,7 @@ torch::Tensor flash_forward_v0_unchecked(torch::Tensor q, torch::Tensor k, torch
 torch::Tensor flash_forward_v0_pytorch_cuda(const torch::Tensor &q,
                                             const torch::Tensor &k,
                                             const torch::Tensor &v) {
-    // Assumes q, k, v already satisfy the validated contiguous [B, H, N, D] contract.
+    // Assumes the validated contiguous self-attention [B, H, N, D] contract (M = N).
     auto out = torch::empty_like(q);
 
     const int batch_size = static_cast<int>(q.size(0));
