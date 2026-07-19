@@ -4,6 +4,8 @@
 
 #include <torch/extension.h>
 
+namespace flash_attention::detail {
+
 // Performs integer division of a by b, rounding up.
 template<std::integral T, std::integral U>
 constexpr auto ceil_div(T a, U b) {
@@ -26,3 +28,5 @@ inline void check_cuda_float32_contiguous_dim(const torch::Tensor &tensor,
     check_cuda_float32_contiguous(tensor, name);
     check_dim(tensor, name, dim);
 }
+
+}  // namespace flash_attention::detail

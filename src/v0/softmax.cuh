@@ -20,6 +20,8 @@ Fused approach
 
 */
 
+namespace flash_attention::detail {
+
 enum class ReductionOp { SUM, MAX };
 
 __device__ __forceinline__ float gpu_add(float a, float b) { return a + b; }
@@ -103,9 +105,10 @@ template <typename T> struct MapExpMinus {
     // RVO: return value optimization
     __device__ __forceinline__ T operator()(const T &val) const {
         // ldg forces to read from the cache
-        const auto [batch_idx, head_idx] = get_batch_head_index(num_heads);
+        const auto [batch_idx, head_idx] = flash_attention::detail::get_batch_head_index(num_heads);
         const int stat_offset =
-            batch_head_offset(batch_idx, head_idx, num_heads, rows) + blockIdx.y;
+            flash_attention::detail::batch_head_offset(batch_idx, head_idx, num_heads, rows) +
+            blockIdx.y;
         return __expf(val - __ldg(max_ptr + stat_offset));
     }
 };
@@ -116,9 +119,10 @@ template <typename T> struct MapDivision {
     int rows;
     // RVO: return value optimization
     __device__ __forceinline__ T operator()(const T &val) const {
-        const auto [batch_idx, head_idx] = get_batch_head_index(num_heads);
+        const auto [batch_idx, head_idx] = flash_attention::detail::get_batch_head_index(num_heads);
         const int stat_offset =
-            batch_head_offset(batch_idx, head_idx, num_heads, rows) + blockIdx.y;
+            flash_attention::detail::batch_head_offset(batch_idx, head_idx, num_heads, rows) +
+            blockIdx.y;
         return val / __ldg(divisor_ptr + stat_offset);
     }
 };
@@ -153,9 +157,10 @@ __global__ void map_reduce_kernel(const T *__restrict__ input,
 
     auto accumulator = R::identity();
     int tid = threadIdx.x;
-    const auto [batch_idx, head_idx] = get_batch_head_index(num_heads);
+    const auto [batch_idx, head_idx] = flash_attention::detail::get_batch_head_index(num_heads);
     const int batch_head_offset_elements =
-        batch_head_offset(batch_idx, head_idx, num_heads, rows * head_dim);
+        flash_attention::detail::batch_head_offset(batch_idx, head_idx, num_heads,
+                                                   rows * head_dim);
     const int row_offset = batch_head_offset_elements + blockIdx.y * head_dim;
     const int idx = blockIdx.x * (BlockSize * CoarsenFactor) + tid;
 
@@ -196,7 +201,8 @@ with coarsen = 4, we iterate over 4 blocks of data with our 1 block of threads
         R::warp_reduce(val);
         if (tid == 0) {
             const int stat_offset =
-                batch_head_offset(batch_idx, head_idx, num_heads, rows) + blockIdx.y;
+                flash_attention::detail::batch_head_offset(batch_idx, head_idx, num_heads, rows) +
+                blockIdx.y;
             R::apply_atomic(reduction_output + stat_offset, val);
         }
     }
@@ -212,9 +218,10 @@ __global__ void map_kernel(const T *input,
     const int col = blockDim.x * blockIdx.x + threadIdx.x;
     if (col >= head_dim)
         return;
-    const auto [batch_idx, head_idx] = get_batch_head_index(num_heads);
+    const auto [batch_idx, head_idx] = flash_attention::detail::get_batch_head_index(num_heads);
     const int batch_head_offset_elements =
-        batch_head_offset(batch_idx, head_idx, num_heads, rows * head_dim);
+        flash_attention::detail::batch_head_offset(batch_idx, head_idx, num_heads,
+                                                   rows * head_dim);
     const int i = batch_head_offset_elements + blockIdx.y * head_dim + col;
     output[i] = mapper(input[i]);
 };
@@ -271,3 +278,5 @@ inline void softmax_rows_launch(const float *input,
 
     cudaFree(device_stats);
 }
+
+}  // namespace flash_attention::detail

@@ -9,11 +9,14 @@ void transpose_cuda_launch(const float *input,
                            int num_heads,
                            int input_width,
                            int input_height) {
-    dim3 block{TILE_SZ, TILE_SZ, 1};
-    dim3 grid{static_cast<unsigned int>(ceil_div(input_width, TILE_SZ)),
-              static_cast<unsigned int>(ceil_div(input_height, TILE_SZ)),
+    dim3 block{flash_attention::detail::TILE_SZ, flash_attention::detail::TILE_SZ, 1};
+    dim3 grid{static_cast<unsigned int>(flash_attention::detail::ceil_div(
+                  input_width, flash_attention::detail::TILE_SZ)),
+              static_cast<unsigned int>(flash_attention::detail::ceil_div(
+                  input_height, flash_attention::detail::TILE_SZ)),
               static_cast<unsigned int>(batch_size * num_heads)};
-    transpose<<<grid, block>>>(input, output, num_heads, input_height, input_width);
+    flash_attention::detail::transpose<<<grid, block>>>(input, output, num_heads, input_height,
+                                                         input_width);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -23,11 +26,14 @@ void scale_cuda_launch(float *data,
                        int input_width,
                        int input_height,
                        float factor) {
-    dim3 block{TILE_SZ, TILE_SZ, 1};
-    dim3 grid{static_cast<unsigned int>(ceil_div(input_width, TILE_SZ)),
-              static_cast<unsigned int>(ceil_div(input_height, TILE_SZ)),
+    dim3 block{flash_attention::detail::TILE_SZ, flash_attention::detail::TILE_SZ, 1};
+    dim3 grid{static_cast<unsigned int>(flash_attention::detail::ceil_div(
+                  input_width, flash_attention::detail::TILE_SZ)),
+              static_cast<unsigned int>(flash_attention::detail::ceil_div(
+                  input_height, flash_attention::detail::TILE_SZ)),
               static_cast<unsigned int>(batch_size * num_heads)};
-    scale<<<grid, block>>>(data, num_heads, input_width, input_height, factor);
+    flash_attention::detail::scale<<<grid, block>>>(data, num_heads, input_width, input_height,
+                                                     factor);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -37,7 +43,8 @@ void softmax_test_cuda_launch(const float *input,
                               int num_heads,
                               int rows,
                               int head_dim) {
-    softmax_rows_launch(input, output, batch_size, num_heads, rows, head_dim);
+    flash_attention::detail::softmax_rows_launch(input, output, batch_size, num_heads, rows,
+                                                  head_dim);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -49,10 +56,13 @@ void matmul_cuda_launch(const float *left,
                         int left_height,
                         int shared_dim,
                         int right_width) {
-    dim3 block{TILE_SZ, TILE_SZ, 1};
-    dim3 grid{static_cast<unsigned int>(ceil_div(right_width, TILE_SZ)),
-              static_cast<unsigned int>(ceil_div(left_height, TILE_SZ)),
+    dim3 block{flash_attention::detail::TILE_SZ, flash_attention::detail::TILE_SZ, 1};
+    dim3 grid{static_cast<unsigned int>(flash_attention::detail::ceil_div(
+                  right_width, flash_attention::detail::TILE_SZ)),
+              static_cast<unsigned int>(flash_attention::detail::ceil_div(
+                  left_height, flash_attention::detail::TILE_SZ)),
               static_cast<unsigned int>(batch_size * num_heads)};
-    matmul<<<grid, block>>>(left, right, output, num_heads, left_height, shared_dim, right_width);
+    flash_attention::detail::matmul<<<grid, block>>>(left, right, output, num_heads, left_height,
+                                                      shared_dim, right_width);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

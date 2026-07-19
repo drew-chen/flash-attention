@@ -5,6 +5,8 @@
 #include "../cuda_utils.h"
 #include "../cuda_utils.cuh"
 
+namespace flash_attention::detail {
+
 constexpr int TILE_SZ{16};
 
 /**
@@ -15,9 +17,10 @@ __global__ void transpose(const float *input,
                           int num_heads,
                           int input_height,
                           int input_width) {
-    const auto [batch_idx, head_idx] = get_batch_head_index(num_heads);
+    const auto [batch_idx, head_idx] = flash_attention::detail::get_batch_head_index(num_heads);
     const int matrix_offset =
-        batch_head_offset(batch_idx, head_idx, num_heads, input_height * input_width);
+        flash_attention::detail::batch_head_offset(batch_idx, head_idx, num_heads,
+                                                   input_height * input_width);
     const int input_r = static_cast<int>((blockIdx.y * TILE_SZ) + threadIdx.y);
     const int input_c = static_cast<int>((blockIdx.x * TILE_SZ) + threadIdx.x);
 
@@ -36,9 +39,10 @@ __global__ void transpose(const float *input,
 }
 
 __global__ void scale(float *data, int num_heads, int data_width, int data_height, float factor) {
-    const auto [batch_idx, head_idx] = get_batch_head_index(num_heads);
+    const auto [batch_idx, head_idx] = flash_attention::detail::get_batch_head_index(num_heads);
     const int matrix_offset =
-        batch_head_offset(batch_idx, head_idx, num_heads, data_height * data_width);
+        flash_attention::detail::batch_head_offset(batch_idx, head_idx, num_heads,
+                                                   data_height * data_width);
     const int r = static_cast<int>((blockIdx.y * TILE_SZ) + threadIdx.y);
     const int c = static_cast<int>((blockIdx.x * TILE_SZ) + threadIdx.x);
     if (r >= data_height || c >= data_width) {
@@ -153,10 +157,13 @@ __global__ void matmul(const float *left,
                        int left_height,
                        int shared_dim,
                        int right_width) {
-    const auto [batch_idx, head_idx] = get_batch_head_index(num_heads);
-    left += batch_head_offset(batch_idx, head_idx, num_heads, left_height * shared_dim);
-    right += batch_head_offset(batch_idx, head_idx, num_heads, shared_dim * right_width);
-    output += batch_head_offset(batch_idx, head_idx, num_heads, left_height * right_width);
+    const auto [batch_idx, head_idx] = flash_attention::detail::get_batch_head_index(num_heads);
+    left += flash_attention::detail::batch_head_offset(batch_idx, head_idx, num_heads,
+                                                        left_height * shared_dim);
+    right += flash_attention::detail::batch_head_offset(batch_idx, head_idx, num_heads,
+                                                         shared_dim * right_width);
+    output += flash_attention::detail::batch_head_offset(batch_idx, head_idx, num_heads,
+                                                          left_height * right_width);
     const int ty = static_cast<int>(threadIdx.y);
     const int tx = static_cast<int>(threadIdx.x);
     const int output_r = (static_cast<int>(blockIdx.y) * TILE_SZ) + ty;
@@ -167,7 +174,7 @@ __global__ void matmul(const float *left,
 
     float dot_prod{};
     // divide left into one row of blocks and divide right into one column of blocks
-    for (int i = 0; i < ceil_div(shared_dim, TILE_SZ); i++) {
+    for (int i = 0; i < flash_attention::detail::ceil_div(shared_dim, TILE_SZ); i++) {
         // load a tile of left's rows. Use a global row idx to choose the rows,
         // and use local col idx to choose idx since we want load all cols of the rows after the
         // iterations
@@ -196,3 +203,5 @@ __global__ void matmul(const float *left,
     }
     output[(output_r * right_width) + output_c] = dot_prod;
 }
+
+}  // namespace flash_attention::detail

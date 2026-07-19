@@ -29,7 +29,7 @@ void matmul_cuda_launch(const float *left,
                         int shared_dim,
                         int right_width);
 torch::Tensor transpose_cuda(const torch::Tensor &input) {
-    check_cuda_float32_contiguous_dim(input, "input", 4);
+    flash_attention::detail::check_cuda_float32_contiguous_dim(input, "input", 4);
 
     const auto batch_size = static_cast<int>(input.size(0));
     const auto num_heads = static_cast<int>(input.size(1));
@@ -43,7 +43,7 @@ torch::Tensor transpose_cuda(const torch::Tensor &input) {
 }
 
 torch::Tensor scale_cuda(const torch::Tensor &input, double factor) {
-    check_cuda_float32_contiguous_dim(input, "input", 4);
+    flash_attention::detail::check_cuda_float32_contiguous_dim(input, "input", 4);
 
     const auto batch_size = static_cast<int>(input.size(0));
     const auto num_heads = static_cast<int>(input.size(1));
@@ -56,7 +56,7 @@ torch::Tensor scale_cuda(const torch::Tensor &input, double factor) {
 }
 
 torch::Tensor softmax_cuda(const torch::Tensor &input) {
-    check_cuda_float32_contiguous_dim(input, "input", 4);
+    flash_attention::detail::check_cuda_float32_contiguous_dim(input, "input", 4);
 
     const auto batch_size = static_cast<int>(input.size(0));
     const auto num_heads = static_cast<int>(input.size(1));
@@ -69,8 +69,8 @@ torch::Tensor softmax_cuda(const torch::Tensor &input) {
 }
 
 torch::Tensor matmul_cuda(const torch::Tensor &left, const torch::Tensor &right) {
-    check_cuda_float32_contiguous_dim(left, "left", 4);
-    check_cuda_float32_contiguous_dim(right, "right", 4);
+    flash_attention::detail::check_cuda_float32_contiguous_dim(left, "left", 4);
+    flash_attention::detail::check_cuda_float32_contiguous_dim(right, "right", 4);
     TORCH_CHECK(left.size(0) == right.size(0), "left and right batch sizes must match");
     TORCH_CHECK(left.size(1) == right.size(1), "left and right head counts must match");
     TORCH_CHECK(left.size(3) == right.size(2), "left width must equal right height");

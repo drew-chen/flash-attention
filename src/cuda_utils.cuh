@@ -2,6 +2,8 @@
 
 #include <cuda_runtime.h>
 
+namespace flash_attention::detail {
+
 struct BatchHeadIndex {
     int batch_idx;
     int head_idx;
@@ -18,3 +20,5 @@ __device__ inline int batch_head_offset(int batch_idx,
                                         int elements_per_batch_head) {
     return ((batch_idx * num_heads) + head_idx) * elements_per_batch_head;
 }
+
+}  // namespace flash_attention::detail
