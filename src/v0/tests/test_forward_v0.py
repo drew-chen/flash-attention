@@ -1,5 +1,8 @@
 import pytest
+    import torch
 
+from src.baseline import forward as baseline_forward
+import flash_attention
 
 @pytest.mark.parametrize(
     "seq_len,head_dim",
@@ -8,13 +11,11 @@ import pytest
 )
 def test_forward_v0_matches_pytorch_reference(seq_len, head_dim):
     """Public V0 correctness contract."""
-    import torch
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
 
-    from src.baseline import forward as baseline_forward
-    import flash_attention
+
 
     q = torch.randn(2, 3, seq_len, head_dim, device="cuda")
     k = torch.randn_like(q)
