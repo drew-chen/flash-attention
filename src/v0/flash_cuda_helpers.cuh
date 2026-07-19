@@ -2,12 +2,10 @@
 
 #include <cuda_runtime.h>
 
+#include "../cuda_utils.h"
 #include "../cuda_utils.cuh"
 
 constexpr int TILE_SZ{16};
-
-// Performs the floating division a/b then rounding up to the nearest int.
-constexpr int ceil_div(int a, int b) { return (a / b) + static_cast<int>(a % b != 0); }
 
 /**
 Performs a tiled transpose from input[height, width] to output[width, height].

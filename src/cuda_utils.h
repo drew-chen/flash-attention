@@ -1,6 +1,14 @@
 #pragma once
 
+#include <concepts>
+
 #include <torch/extension.h>
+
+// Performs integer division of a by b, rounding up.
+template<std::integral T, std::integral U>
+constexpr auto ceil_div(T a, U b) {
+    return (a / b) + static_cast<decltype(a / b)>(a % b != 0);
+}
 
 inline void check_cuda_float32_contiguous(const torch::Tensor &tensor, const char *name) {
     TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");

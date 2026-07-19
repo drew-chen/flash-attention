@@ -3,8 +3,6 @@
 #include "../../flash_cuda_helpers.cuh"
 #include "../../softmax.cuh"
 
-int ceil_div_host(int a, int b) { return ceil_div(a, b); }
-
 void transpose_cuda_launch(const float *input,
                            float *output,
                            int batch_size,

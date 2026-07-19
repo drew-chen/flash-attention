@@ -28,8 +28,6 @@ void matmul_cuda_launch(const float *left,
                         int left_height,
                         int shared_dim,
                         int right_width);
-int ceil_div_host(int a, int b);
-
 torch::Tensor transpose_cuda(const torch::Tensor &input) {
     check_cuda_float32_contiguous_dim(input, "input", 4);
 
@@ -95,5 +93,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("scale_cuda", &scale_cuda, "Test wrapper for the CUDA scale helper");
     m.def("softmax_cuda", &softmax_cuda, "Test wrapper for the CUDA softmax helper");
     m.def("matmul_cuda", &matmul_cuda, "Test wrapper for the CUDA matmul helper");
-    m.def("ceil_div_host", &ceil_div_host, "Host wrapper for CUDA ceil_div helper");
 }

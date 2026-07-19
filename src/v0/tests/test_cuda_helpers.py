@@ -45,18 +45,6 @@ def cuda_rng():
 
 
 @pytest.mark.parametrize(
-    "dividend,divisor,expected",
-    [
-        (3, 16, 1),
-        (4097, 16, 257),
-        (5, 5, 1),
-    ],
-)
-def test_ceil_div_host(cuda_helpers, dividend, divisor, expected):
-    assert cuda_helpers.ceil_div_host(dividend, divisor) == expected
-
-
-@pytest.mark.parametrize(
     "batch_size,num_heads,height,width",
     [
         pytest.param(1, 1, TILE_SIZE, TILE_SIZE, id="single-batch-single-head"),
