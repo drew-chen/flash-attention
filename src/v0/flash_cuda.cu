@@ -62,12 +62,12 @@ void naive_forward_v0_cuda_launch(const float *q,
 
     dim3 block{detail::TILE_SZ, detail::TILE_SZ, 1};
     // Grid for [B, H, N, D] outputs: (D tiles, N tiles, B * H).
-    dim3 qkv_grid{static_cast<unsigned int>(detail::ceil_div(head_dim, detail::TILE_SZ)),
-                  static_cast<unsigned int>(detail::ceil_div(seq_len, detail::TILE_SZ)),
+    dim3 qkv_grid{static_cast<unsigned int>(detail::ceil_div<int>(head_dim, detail::TILE_SZ)),
+                  static_cast<unsigned int>(detail::ceil_div<int>(seq_len, detail::TILE_SZ)),
                   static_cast<unsigned int>(batch_head_count)};
     // Grid for [B, H, N, N] score/probability outputs: (N tiles, N tiles, B * H).
-    dim3 score_grid{static_cast<unsigned int>(detail::ceil_div(seq_len, detail::TILE_SZ)),
-                    static_cast<unsigned int>(detail::ceil_div(seq_len, detail::TILE_SZ)),
+    dim3 score_grid{static_cast<unsigned int>(detail::ceil_div<int>(seq_len, detail::TILE_SZ)),
+                    static_cast<unsigned int>(detail::ceil_div<int>(seq_len, detail::TILE_SZ)),
                     static_cast<unsigned int>(batch_head_count)};
 
     detail::transpose<<<qkv_grid, block>>>(k, k_transpose, num_heads, seq_len, head_dim);

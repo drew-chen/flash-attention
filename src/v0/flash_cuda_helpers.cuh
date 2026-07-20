@@ -5,9 +5,9 @@
 #include "../cuda_utils.h"
 #include "../cuda_utils.cuh"
 
-constexpr int TILE_SZ{16};
-
 namespace flash_attention::detail {
+
+constexpr int TILE_SZ{16};
 
 /**
 Performs a tiled transpose from input[height, width] to output[width, height].
@@ -197,6 +197,7 @@ __global__ void matmul(const float *left,
         for (int j = 0; j < TILE_SZ; j++) {
             dot_prod += left_tile[threadIdx.y][j] * right_tile[j][threadIdx.x];
         }
+        __syncthreads();
     }
     if (output_r >= left_height || output_c >= right_width) {
         return;
