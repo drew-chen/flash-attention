@@ -5,9 +5,9 @@
 #include "../cuda_utils.h"
 #include "../cuda_utils.cuh"
 
-namespace flash_attention::detail {
-
 constexpr int TILE_SZ{16};
+
+namespace flash_attention::detail {
 
 /**
 Performs a tiled transpose from input[height, width] to output[width, height].
@@ -174,7 +174,7 @@ __global__ void matmul(const float *left,
 
     float dot_prod{};
     // divide left into one row of blocks and divide right into one column of blocks
-    for (int i = 0; i < flash_attention::detail::ceil_div(shared_dim, TILE_SZ); i++) {
+    for (int i = 0; i < flash_attention::detail::ceil_div<int>(shared_dim, TILE_SZ); i++) {
         // load a tile of left's rows. Use a global row idx to choose the rows,
         // and use local col idx to choose idx since we want load all cols of the rows after the
         // iterations

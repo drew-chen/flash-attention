@@ -6,10 +6,10 @@
 
 namespace flash_attention::detail {
 
-// Performs integer division of a by b, rounding up.
-template<std::integral T, std::integral U>
-constexpr auto ceil_div(T a, U b) {
-    return (a / b) + static_cast<decltype(a / b)>(a % b != 0);
+// Performs integer division of a by b, rounding up then casts to T.
+template<std::integral T>
+constexpr auto ceil_div(std::integral auto a, std::integral auto b) {
+    return static_cast<T>((a / b) + static_cast<decltype(a / b)>(a % b != 0));
 }
 
 inline void check_cuda_float32_contiguous(const torch::Tensor &tensor, const char *name) {
