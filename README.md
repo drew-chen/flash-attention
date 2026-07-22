@@ -1,42 +1,88 @@
 # FlashAttention
 
-Pedagogical project for a handwritten CUDA FlashAttention implementation. PyTorch
-provides the Python binding and correctness reference.
+Pedagogical project for building handwritten CUDA attention kernels. PyTorch provides the Python
+binding and correctness reference.
 
-## Optimization worklog
+## Usage
 
-**Primary shape:** `B=4, H=12, M=N=2048, D=64, dtype=float32, causal=false`
+```python
+import torch
+import flash_attention_v1
 
-`causal=false` means every query may attend to every key; no triangular future-token mask is
-applied.
+q = torch.randn(2, 3, 32, 16, device="cuda")
+k = torch.randn_like(q)
+v = torch.randn_like(q)
 
-| Version | Latency (µs) | Δ vs. baseline | FLOPs per second (TFLOP/s)* | DRAM bandwidth (GB/s)* | Arithmetic Intensity (FLOP/byte)* | Conclusion |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Baseline | 8418.95 | — | --- | --- | --- | Reference measurement |
-| V0 | 33890.02 | +302.5% | --- | --- | --- | Draft non-flash attention implementation is worse than baseline |
-| V1 | 172278.32 | +1946.3% | 0.336 | 0.416 | 809.701 | Fused online-softmax kernel follows FA 1 |
+out = flash_attention_v1.forward(q, k, v)
+```
 
-V1's high DRAM arithmetic intensity but low compute throughput indicates that it is limited by
-compute execution and insufficient parallelism rather than DRAM bandwidth.
+## Implementations
 
-\* V1 hardware metrics were measured on an RTX 4080. See the
-[profiling appendix](#appendix-profiling-fused-implementations) to refresh them.
+| Version | Design | Purpose |
+| --- | --- | --- |
+| Baseline | Explicit PyTorch matmul, scaling, softmax, and matmul | Correctness and latency reference |
+| V0 | Unfused CUDA kernels that materialize the attention matrix | Naive CUDA starting point |
+| V1 | One fused CUDA kernel with tiled online softmax | First FlashAttention-style implementation |
+
+The CUDA implementations accept contiguous CUDA `float32` tensors. V0 requires self-attention
+with `M = N`; V1 accepts Q `[B, H, M, D]` and K/V `[B, H, N, D]`.
+
+## Results
+
+Primary shape: `B=4, H=12, M=N=2048, D=64, dtype=float32, causal=false`.
+
+### Latency
+
+| Version | Latency (µs) | Δ vs. baseline |
+| --- | ---: | ---: |
+| Baseline | 8418.95 | — |
+| V0 | 33890.02 | +302.5% |
+| V1 | 172278.32 | +1946.3% |
+
+### V1 profiling
+
+The fused v1 kernel was profiled on an original RTX 4080:
+
+| Metric | Measured | RTX 4080 reference |
+| --- | ---: | ---: |
+| FP32 throughput | 0.336 TFLOP/s | 48.7 TFLOP/s peak |
+| DRAM bandwidth | 0.416 GB/s | 716.8 GB/s peak |
+| Arithmetic intensity | 809.701 FLOP/byte | 67.9 FLOP/byte ridge point |
+| Occupancy | 8.33% achieved | 16.67% theoretical |
+| Grid | 48 blocks | 76 SMs |
+| Shared memory | 38.40 KB/block | Limits residency to 2 blocks/SM |
+
+The hardware references come from NVIDIA's
+[Ada GPU architecture whitepaper](https://images.nvidia.com/aem-dam/Solutions/Data-Center/l4/nvidia-ada-gpu-architecture-whitepaper-V2.02.pdf).
+
+### Notes
+
+#### Baseline
+
+The explicit PyTorch implementation is the correctness and latency reference.
+
+#### V0
+
+V0 is slower than the PyTorch baseline despite using tiled CUDA kernels.
+
+#### V1
+
+V1 avoids the full attention matrix, but one block per `(batch, head)` produces only 48 blocks, so
+some of the RTX 4080's 76 SMs receive no work. Shared memory caps residency at eight theoretical
+warps per SM; the kernel achieves four.
+
+The next architectural step is to parallelize independent query tiles, following the
+FlashAttention-2 work partition rather than tuning the current 48-block launch.
 
 ## Setup
 
-Requires Python 3.12, a CUDA-enabled PyTorch build, a compatible CUDA toolkit
-with `nvcc`, and a CUDA-compatible C++20 compiler. Create an environment and
-install the Python dependencies:
+Requires Python 3.12, CUDA-enabled PyTorch, a compatible CUDA toolkit with `nvcc`, and a
+CUDA-compatible C++20 compiler.
 
 ```bash
 uv venv --python 3.12 .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-```
-
-Build both versioned extensions (repeat after changing C++ or CUDA files):
-
-```bash
 python setup.py build_ext --inplace
 ```
 
@@ -45,25 +91,6 @@ To target a different GPU architecture:
 ```bash
 TORCH_CUDA_ARCH_LIST=<value> python setup.py build_ext --inplace
 ```
-
-## Python usage
-
-```python
-import torch
-import flash_attention_v0
-import flash_attention_v1
-
-q = torch.randn(2, 3, 32, 16, device="cuda")
-k = torch.randn_like(q)
-v = torch.randn_like(q)
-
-out_v0 = flash_attention_v0.forward(q, k, v)
-out_v1 = flash_attention_v1.forward(q, k, v)
-```
-
-Both accept contiguous CUDA `float32` tensors. V0 requires self-attention with
-`M = N`; V1 accepts Q `[B, H, M, D]` and K/V `[B, H, N, D]`.
-Use `src.baseline.forward` as the PyTorch correctness reference.
 
 ## Tests
 
@@ -83,51 +110,55 @@ compute-sanitizer --target-processes all python -m pytest -q
 python benchmark.py
 ```
 
-The fixed suite covers self-attention shapes `M=N=512, 1024, 2048` at
-`B=4, H=12, D=64`, with 25 warmups and 100 timed calls.
+The fixed suite measures `M=N=512, 1024, 2048` at `B=4, H=12, D=64`, using 25 warmups and 100
+timed calls.
 
-V1 launches one block per `(batch, head)`, so this shape launches only 48 blocks. Nsight Compute
-flags this grid as too small for the profiled RTX 4080's 76 SMs: it provides only 0.32 full waves
-and leaves some SMs with no work. The report measures 10.64% SM throughput but only 0.06% DRAM
-throughput, confirming that DRAM bandwidth is not the primary limiter. Its workload-distribution
-rule also estimates a 23.4% speedup from eliminating the resulting SM imbalance. Increasing
-parallelism within or across query tiles is therefore the first optimization target.
+## Profiling
 
-## Appendix: profiling fused implementations
+Profiling is restricted to fused implementations. Baseline and v0 launch multiple kernels, so a
+single roofline or occupancy value would be ambiguous.
 
-Profile v1 with Nsight Compute's built-in roofline section:
+`profile.sh` captures the roofline, occupancy, and launch statistics in one report. Profile one
+fused implementation:
 
 ```bash
-implementation=v1
-sudo /usr/local/cuda/bin/ncu \
-  --set roofline \
-  --replay-mode kernel \
-  --nvtx \
-  --nvtx-include "flash_attention.${implementation}/" \
-  --export "/tmp/flash_${implementation}_s2048_roofline" \
-  --force-overwrite \
-  python profile_cuda.py "$implementation"
+./profile.sh v1
 ```
 
-Open the report in Nsight Compute:
+Or profile every registered fused implementation:
 
 ```bash
-ncu-ui /tmp/flash_v1_s2048_roofline.ncu-rep
+./profile.sh all
 ```
 
-Or print the single-precision roofline overview in the terminal:
+`all` prints a skip message for baseline and v0 because they are unfused. Passing either one
+directly is an error. If non-admin GPU performance counters are disabled, run the script with
+`sudo`; it uses the repository's virtual environment by absolute path.
+
+Reports are saved as `/tmp/flash_<implementation>_s2048_profile.ncu-rep`.
+
+Open the report:
+
+```bash
+ncu-ui /tmp/flash_v1_s2048_profile.ncu-rep
+```
+
+Print occupancy and launch statistics:
 
 ```bash
 /usr/local/cuda/bin/ncu \
-  --import /tmp/flash_v1_s2048_roofline.ncu-rep \
+  --import /tmp/flash_v1_s2048_profile.ncu-rep \
+  --page details \
+  --section Occupancy \
+  --section LaunchStats
+```
+
+Print the roofline overview:
+
+```bash
+/usr/local/cuda/bin/ncu \
+  --import /tmp/flash_v1_s2048_profile.ncu-rep \
   --page details \
   --section SpeedOfLight_RooflineChart \
   --print-details all
 ```
-
-Nsight derives the kernel's achieved FLOP/s, memory traffic, and arithmetic
-intensity and displays them together on the roofline chart. This maps cleanly to
-v1 and later fused implementations because one attention kernel represents the
-complete forward operation. V0 remains in the latency benchmark, but is omitted
-from roofline profiling because its separate kernels do not form one roofline
-point.
