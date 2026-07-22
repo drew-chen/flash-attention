@@ -7,11 +7,12 @@ import torch
 from benchmark import IMPLEMENTATIONS, make_inputs
 
 SEQ_LEN = 2048
+FUSED_IMPLEMENTATIONS = ("v1",)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("implementation", choices=IMPLEMENTATIONS)
+    parser.add_argument("implementation", choices=FUSED_IMPLEMENTATIONS)
     implementation = parser.parse_args().implementation
 
     forward = IMPLEMENTATIONS[implementation]

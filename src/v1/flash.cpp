@@ -13,11 +13,11 @@ void flash_forward_v1_cuda_launch(const float *q,
                                   int query_seq_len,
                                   int kv_seq_len,
                                   int head_dim);
-torch::Tensor flash_forward_v0_pytorch_cuda(const torch::Tensor &q,
+torch::Tensor flash_forward_v1_pytorch_cuda(const torch::Tensor &q,
                                             const torch::Tensor &k,
                                             const torch::Tensor &v);
 
-// Validates the public contract for flash_attention.forward_v0(...):
+// Validates the public contract for flash_attention_v1.forward(...):
 // CUDA float32 contiguous attention tensors: q [B, H, M, D] and k/v [B, H, N, D].
 void validate_flash_inputs(const torch::Tensor &q, const torch::Tensor &k, const torch::Tensor &v) {
     flash_attention::detail::check_cuda_float32_contiguous_dim(q, "q", 4);
@@ -29,16 +29,16 @@ void validate_flash_inputs(const torch::Tensor &q, const torch::Tensor &k, const
     TORCH_CHECK(q.size(3) == k.size(3), "q and k must have the same head dimension");
 }
 
-torch::Tensor flash_forward_v0(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
+torch::Tensor flash_forward_v1(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
     validate_flash_inputs(q, k, v);
-    return flash_forward_v0_pytorch_cuda(q, k, v);
+    return flash_forward_v1_pytorch_cuda(q, k, v);
 }
 
-torch::Tensor flash_forward_v0_assume_valid(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
-    return flash_forward_v0_pytorch_cuda(q, k, v);
+torch::Tensor flash_forward_v1_unchecked(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
+    return flash_forward_v1_pytorch_cuda(q, k, v);
 }
 
-torch::Tensor flash_forward_v0_pytorch_cuda(const torch::Tensor &q,
+torch::Tensor flash_forward_v1_pytorch_cuda(const torch::Tensor &q,
                                             const torch::Tensor &k,
                                             const torch::Tensor &v) {
     // Assumes q is [B, H, M, D] and k/v are [B, H, N, D].
@@ -60,10 +60,10 @@ torch::Tensor flash_forward_v0_pytorch_cuda(const torch::Tensor &q,
 }  // namespace flash_attention
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward_v0", &flash_attention::flash_forward_v0,
+    m.def("forward", &flash_attention::flash_forward_v1,
           "V1 FlashAttention forward. Expects q [B, H, M, D] and k/v [B, H, N, D] CUDA "
           "float32 contiguous tensors.");
-    m.def("forward_v0_assume_valid", &flash_attention::flash_forward_v0_assume_valid,
-          "V1 FlashAttention forward assuming q [B, H, M, D] and k/v [B, H, N, D] CUDA "
-          "float32 contiguous tensors.");
+    m.def("forward_unchecked", &flash_attention::flash_forward_v1_unchecked,
+          "V1 FlashAttention forward without input validation. "
+          "Requires q [B, H, M, D] and k/v [B, H, N, D] CUDA float32 contiguous tensors.");
 }

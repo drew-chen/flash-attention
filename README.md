@@ -5,15 +5,22 @@ provides the Python binding and correctness reference.
 
 ## Optimization worklog
 
-**Primary shape:** `B=2, H=8, M=N=2048, D=64, dtype=float32, causal=false`
+**Primary shape:** `B=4, H=12, M=N=2048, D=64, dtype=float32, causal=false`
+
+`causal=false` means every query may attend to every key; no triangular future-token mask is
+applied.
 
 | Version | Latency (µs) | Δ vs. baseline | FLOPs per second (TFLOP/s)* | DRAM bandwidth (GB/s)* | Arithmetic Intensity (FLOP/byte)* | Conclusion |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Baseline | 2869.55 | — | 9.202 | 552.211 | 16.664 | Reference measurement |
-| V0 | 13752.51 | +379.3% | 2.140 | 354.121 | 6.044 | Draft non-flash attention implementation is worse than baseline |
-| V1 |  ---: | ---: | ---: | ---: | ---:  | Fused kernel, online softmax, skipping tranpose |
+| Baseline | 8418.95 | — | --- | --- | --- | Reference measurement |
+| V0 | 33890.02 | +302.5% | --- | --- | --- | Draft non-flash attention implementation is worse than baseline |
+| V1 | 172278.32 | +1946.3% | 0.336 | 0.416 | 809.701 | Fused online-softmax kernel follows FA 1 |
 
-\* See the [profiling appendix](#appendix-profiling-unfused-implementations).
+V1's high DRAM arithmetic intensity but low compute throughput indicates that it is limited by
+compute execution and insufficient parallelism rather than DRAM bandwidth.
+
+\* V1 hardware metrics were measured on an RTX 4080. See the
+[profiling appendix](#appendix-profiling-fused-implementations) to refresh them.
 
 ## Setup
 
@@ -27,7 +34,7 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-Build the extension (repeat after changing C++ or CUDA files):
+Build both versioned extensions (repeat after changing C++ or CUDA files):
 
 ```bash
 python setup.py build_ext --inplace
@@ -43,18 +50,19 @@ TORCH_CUDA_ARCH_LIST=<value> python setup.py build_ext --inplace
 
 ```python
 import torch
-import flash_attention
+import flash_attention_v0
+import flash_attention_v1
 
 q = torch.randn(2, 3, 32, 16, device="cuda")
 k = torch.randn_like(q)
 v = torch.randn_like(q)
 
-out = flash_attention.forward_v0(q, k, v)
+out_v0 = flash_attention_v0.forward(q, k, v)
+out_v1 = flash_attention_v1.forward(q, k, v)
 ```
 
-`forward_v0` implements self-attention only: it accepts contiguous CUDA `float32`
-Q, K, and V tensors, each shaped `[B, H, N, D]`, where the general attention
-dimensions satisfy `M = N`. Its output has the same shape.
+Both accept contiguous CUDA `float32` tensors. V0 requires self-attention with
+`M = N`; V1 accepts Q `[B, H, M, D]` and K/V `[B, H, N, D]`.
 Use `src.baseline.forward` as the PyTorch correctness reference.
 
 ## Tests
@@ -76,55 +84,50 @@ python benchmark.py
 ```
 
 The fixed suite covers self-attention shapes `M=N=512, 1024, 2048` at
-`B=2, H=8, D=64`, with 25
-warmups and 100 timed calls.
+`B=4, H=12, D=64`, with 25 warmups and 100 timed calls.
 
-## Appendix: profiling unfused implementations
+V1 launches one block per `(batch, head)`, so this shape launches only 48 blocks. Nsight Compute
+flags this grid as too small for the profiled RTX 4080's 76 SMs: it provides only 0.32 full waves
+and leaves some SMs with no work. The report measures 10.64% SM throughput but only 0.06% DRAM
+throughput, confirming that DRAM bandwidth is not the primary limiter. Its workload-distribution
+rule also estimates a 23.4% speedup from eliminating the resulting SM imbalance. Increasing
+parallelism within or across query tiles is therefore the first optimization target.
 
-Set `implementation` to `v0` or `baseline`:
+## Appendix: profiling fused implementations
+
+Profile v1 with Nsight Compute's built-in roofline section:
 
 ```bash
-implementation=v0
-```
-
-Collect duration and DRAM traffic for one complete NVTX-marked forward range:
-
-```bash
+implementation=v1
 sudo /usr/local/cuda/bin/ncu \
-  --replay-mode range \
-  --nvtx \
-  --nvtx-include "flash_attention.${implementation}/" \
-  --metrics dram__bytes.sum,gpu__time_duration.sum \
-  --export "/tmp/flash_${implementation}_s2048_range" \
-  --force-overwrite \
-  python profile_cuda.py "$implementation"
-```
-
-Collect the FP32 instruction counts for each kernel in that range:
-
-```bash
-sudo /usr/local/cuda/bin/ncu \
+  --set roofline \
   --replay-mode kernel \
   --nvtx \
   --nvtx-include "flash_attention.${implementation}/" \
-  --metrics smsp__sass_thread_inst_executed_op_fadd_pred_on.sum,smsp__sass_thread_inst_executed_op_fmul_pred_on.sum,smsp__sass_thread_inst_executed_op_ffma_pred_on.sum \
-  --export "/tmp/flash_${implementation}_s2048_kernels" \
+  --export "/tmp/flash_${implementation}_s2048_roofline" \
   --force-overwrite \
   python profile_cuda.py "$implementation"
 ```
 
-Combine the reports as follows:
+Open the report in Nsight Compute:
 
-```text
-FP32 operations = Σ(FADD + FMUL + 2 × FFMA)
-FLOPs per second = FP32 operations / range duration
-DRAM bandwidth = range DRAM bytes / range duration
-Arithmetic intensity = FP32 operations / range DRAM bytes
+```bash
+ncu-ui /tmp/flash_v1_s2048_roofline.ncu-rep
 ```
 
-FP32 operations (`FADD + FMUL + 2 × FFMA`) are summed across each
-implementation's kernel profiles; duration and DRAM bytes cover its complete
-NVTX-marked forward range. Nsight cannot collect FP32 instruction counts for a
-multi-kernel range, which is why the kernel and range reports are collected
-separately. Special-function operations such as `exp` are not included in the
-FP32 operation count.
+Or print the single-precision roofline overview in the terminal:
+
+```bash
+/usr/local/cuda/bin/ncu \
+  --import /tmp/flash_v1_s2048_roofline.ncu-rep \
+  --page details \
+  --section SpeedOfLight_RooflineChart \
+  --print-details all
+```
+
+Nsight derives the kernel's achieved FLOP/s, memory traffic, and arithmetic
+intensity and displays them together on the roofline chart. This maps cleanly to
+v1 and later fused implementations because one attention kernel represents the
+complete forward operation. V0 remains in the latency benchmark, but is omitted
+from roofline profiling because its separate kernels do not form one roofline
+point.

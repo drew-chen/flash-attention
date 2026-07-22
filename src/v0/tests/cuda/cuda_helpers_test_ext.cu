@@ -10,9 +10,9 @@ void transpose_cuda_launch(const float *input,
                            int input_width,
                            int input_height) {
     dim3 block{flash_attention::detail::TILE_SZ, flash_attention::detail::TILE_SZ, 1};
-    dim3 grid{static_cast<unsigned int>(flash_attention::detail::ceil_div(
+    dim3 grid{static_cast<unsigned int>(flash_attention::detail::ceil_div<int>(
                   input_width, flash_attention::detail::TILE_SZ)),
-              static_cast<unsigned int>(flash_attention::detail::ceil_div(
+              static_cast<unsigned int>(flash_attention::detail::ceil_div<int>(
                   input_height, flash_attention::detail::TILE_SZ)),
               static_cast<unsigned int>(batch_size * num_heads)};
     flash_attention::detail::transpose<<<grid, block>>>(input, output, num_heads, input_height,
@@ -27,9 +27,9 @@ void scale_cuda_launch(float *data,
                        int input_height,
                        float factor) {
     dim3 block{flash_attention::detail::TILE_SZ, flash_attention::detail::TILE_SZ, 1};
-    dim3 grid{static_cast<unsigned int>(flash_attention::detail::ceil_div(
+    dim3 grid{static_cast<unsigned int>(flash_attention::detail::ceil_div<int>(
                   input_width, flash_attention::detail::TILE_SZ)),
-              static_cast<unsigned int>(flash_attention::detail::ceil_div(
+              static_cast<unsigned int>(flash_attention::detail::ceil_div<int>(
                   input_height, flash_attention::detail::TILE_SZ)),
               static_cast<unsigned int>(batch_size * num_heads)};
     flash_attention::detail::scale<<<grid, block>>>(data, num_heads, input_width, input_height,
@@ -57,9 +57,9 @@ void matmul_cuda_launch(const float *left,
                         int shared_dim,
                         int right_width) {
     dim3 block{flash_attention::detail::TILE_SZ, flash_attention::detail::TILE_SZ, 1};
-    dim3 grid{static_cast<unsigned int>(flash_attention::detail::ceil_div(
+    dim3 grid{static_cast<unsigned int>(flash_attention::detail::ceil_div<int>(
                   right_width, flash_attention::detail::TILE_SZ)),
-              static_cast<unsigned int>(flash_attention::detail::ceil_div(
+              static_cast<unsigned int>(flash_attention::detail::ceil_div<int>(
                   left_height, flash_attention::detail::TILE_SZ)),
               static_cast<unsigned int>(batch_size * num_heads)};
     flash_attention::detail::matmul<<<grid, block>>>(left, right, output, num_heads, left_height,

@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from src.baseline import forward as baseline_forward
-import flash_attention
+import flash_attention_v0
 
 @pytest.mark.parametrize(
     "batch_size,num_heads,seq_len,head_dim",
@@ -23,6 +23,6 @@ def test_forward_v0_matches_pytorch_reference(batch_size, num_heads, seq_len, he
     v = torch.randn_like(q)
 
     expected = baseline_forward(q, k, v)
-    actual = flash_attention.forward_v0(q, k, v)
+    actual = flash_attention_v0.forward(q, k, v)
 
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)

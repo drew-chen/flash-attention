@@ -65,7 +65,7 @@ def build_extension_modules():
 
     return [
         CUDAExtension(
-            name="flash_attention",
+            name="flash_attention_v0",
             sources=[
                 str(ROOT / "src/v0/flash.cpp"),
                 str(ROOT / "src/v0/flash_cuda.cu"),
@@ -74,7 +74,18 @@ def build_extension_modules():
                 "cxx": HOST_WARNING_FLAGS,
                 "nvcc": NVCC_WARNING_FLAGS,
             },
-        )
+        ),
+        CUDAExtension(
+            name="flash_attention_v1",
+            sources=[
+                str(ROOT / "src/v1/flash.cpp"),
+                str(ROOT / "src/v1/flash_cuda.cu"),
+            ],
+            extra_compile_args={
+                "cxx": HOST_WARNING_FLAGS,
+                "nvcc": NVCC_WARNING_FLAGS,
+            },
+        ),
     ]
 
 

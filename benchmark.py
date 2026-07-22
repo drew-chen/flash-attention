@@ -2,11 +2,12 @@
 
 import torch
 
-import flash_attention
+import flash_attention_v0
+import flash_attention_v1
 from src.baseline import forward as baseline_forward
 
-BATCH_SIZE = 2
-NUM_HEADS = 8
+BATCH_SIZE = 4
+NUM_HEADS = 12
 HEAD_DIM = 64
 SEQ_LENS = (512, 1024, 2048)
 WARMUP = 25
@@ -14,12 +15,13 @@ REPETITIONS = 100
 
 IMPLEMENTATIONS = {
     "baseline": baseline_forward,
-    "v0": flash_attention.forward_v0_unchecked,
+    "v0": flash_attention_v0.forward_unchecked,
+    "v1": flash_attention_v1.forward_unchecked,
 }
 
 
-def make_inputs(seq_len):
-    q = torch.randn(BATCH_SIZE, NUM_HEADS, seq_len, HEAD_DIM, device="cuda")
+def make_inputs(seq_len, batch_size=BATCH_SIZE, num_heads=NUM_HEADS):
+    q = torch.randn(batch_size, num_heads, seq_len, HEAD_DIM, device="cuda")
     return q, torch.randn_like(q), torch.randn_like(q)
 
 
