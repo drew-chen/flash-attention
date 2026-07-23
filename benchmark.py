@@ -7,6 +7,7 @@ import torch
 import flash_attention_v0
 import flash_attention_v1
 import flash_attention_v2
+import flash_attention_v3
 from src.baseline import forward as baseline_forward
 
 BATCH_SIZE = 4
@@ -21,6 +22,7 @@ IMPLEMENTATIONS = {
     "v0": flash_attention_v0.forward_unchecked,
     "v1": flash_attention_v1.forward_unchecked,
     "v2": flash_attention_v2.forward_unchecked,
+    "v3": flash_attention_v3.forward_unchecked,
 }
 
 
