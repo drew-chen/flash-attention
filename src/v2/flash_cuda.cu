@@ -6,17 +6,7 @@
 #include <limits>
 
 /*
-In these notes, a tiled flash attention is constructed step-by-step from
-normal attention. These notes skip how the reccurence relation used
-is derived.
-
-Algorithms:
-1. Standard attention
-2. Single-row, two-pass online-softmax attention
-3. Single-row, single-pass online-softmax attention
-4. FlashAttention (tiled)
-
-Algorithm 4 is the one that is implemented.
+These notes describe my simplified implementation of Tri Dao's flash attention 2. 
 
 flash_forward_cuda_launch expects raw pointers for tensors shaped as:
 
@@ -39,279 +29,169 @@ Dimensions:
 - (head_dim) D: head dimension. Size of the per-token vector inside one head.
 
 
-Assumes self-attention: q, k, v are CUDA float32 contiguous tensors with the same
-shape [B, H, N, D], so M = N = seq_len.
+FlashAttention 2
 
-Indexing convention: tensor indices are zero-based. A loop over N elements uses
-i = 0 to N - 1. Recurrence state 0 is the empty-prefix state, so processing
-tensor element i advances recurrence state i to state i + 1.
+1. delay normalizing O by the softmax denominator
 
-1. Standard attention algorithm:
+Rather than dividing partial outputs by the updated softmax denominator l_i after
+each K/V tile, store the unnormalized numerator and apply the denominator once at
+the end, prior to writing the final output for a block. The paper calls this output
+"unscaled", though technically the old numerator is still rescaled by
+exp(m_old - m_new) whenever the running maximum changes.
 
-S = QK^T / sqrt(D) (pre-softmax logits, ie, score)
-P = row_softmax(S) (attention probabilities/weight matrix)
-O = PV  (self-attention output)
+2. parallelize blocks on the query sequence dimension
 
+As seen from the v1 profiling, the v1 algorithm can have poor performance
+as sequence length lengthens and the batch dim decreases. This is addressed
+by dividing the work for a particular [B, H] across multiple query-tile blocks.
+In this implementation, the query-tile index is represented by the grid's z dim.
 
-2. Single-row, two-pass online-softmax attention:
+3. better warp partitioning
 
-Algorithm for one row of output O[b, h, k, :], with b, h, and query row k fixed.
-This algorithm avoids materializing the full attention matrix, but saves one score row x.
+This section describes the original optimized FA1 CUDA kernel's warp partitioning,
+as described by the FA2 paper, vs. FA2's warp partitioning. The FA1 paper itself
+describes the tiled algorithm but does not describe this warp-level mapping.
 
-Notes taken from Zihao Ye's "From Online Softmax to FlashAttention".
+    i) FA1 warp partitioning:
 
-Derivation of online softmax's recurrence relation is not shown.
+The optimized v1 uses the "split-K" approach for matrix multiplication. It uses
+warps to divide the key-sequence dimension B_c, which is the common/reduction
+dimension of P @ V, and later reduces the warp-local partial outputs into the
+block-level result.
 
+In FA1's optimized kernel, a warp owns the output of utilizing the entire
+Q tile while only using a key-sequence partition of the current K/V data tile.
+Since queries represent the rows of the score and K/V positions represent its
+columns, the score output of a warp is [B_r, C], where B_c/#warps = C (I would
+use K here if it didn't represent key).
 
-Pass 1:
+Note: my implementation of FA1 was simpler and more serial than this.
 
-Initialize:
-    m_0 = -infinity  # Running maximum of the processed logits.
-    l_0 = 0          # Running numerically stable softmax denominator.
+Ex:
 
-for i = 0 to N - 1:
-    x_i = dot(Q[k, :], K[i, :]) / sqrt(D)  # Scalar logit for query k and the current key i.
-    m_{i+1} = max(m_i, x_i)                # Running maximum for the score row.
-    l_{i+1} = l_i*e^(m_i - m_{i+1})        # Update the running max-shifted softmax normalizer.
-            + e^(x_i - m_{i+1})
-save x_i values for this score row
+S_iw = Q_i @ K^T_w          # warp-local score-column slice
+S_i = [S_i1 S_i2 ... S_iw]  # logical concatenation along the col dim
 
-Pass 2:
+The problem is that calculating the softmax of the score requires communication
+between warps because an entire score row is needed, but each warp only owns a
+column subset of each row.
 
-Initialize:
-    o_0 = zeros(D)  # Running partial attention-output row vector.
+When later multiplying by V, a similar issue occurs.
 
-for i = 0 to N - 1:
-    a_i = e^(x_i - m_N)/l_N         # Calculate the numerically stable attention weight.
+    ii) FA2 warp partitioning:
 
-    o_{i+1} = o_i + a_i*V[i, :]     # Accumulate the weighted value row.
-                                    # Over N iterations, this is equivalent to row vector
-                                    # a * matrix V, since the full attention-weight row
-                                    # a is dotted with each column of V;
-                                    # equivalently, each row V[i, :] is scaled by a_i
-                                    # before the rows are summed.
+V2 splits the Q data tile such that each warp calculates the result for only a
+row slice of the Q tile while using all of the current K^T and V tile.
 
-    O[b, h, k, :] = o_N             # Save row vector output
+Exl:
 
+S_wi = Q_w @ K^T_i
 
-3. Single-row, single-pass online-softmax attention
+Since each warp owns full Q rows, that means it also fully owns the corresponding
+rows of the score and attention output. If the warp results were logically combined,
+they would stack by row.
 
-Using a flash attention recurrence relationship yields:
-
-Initialize:
-    m_0 = -infinity  # Running maximum of the processed logits.
-    l_0 = 0          # Running numerically stable softmax denominator.
-    o_0 = zeros(D)   # Running normalized attention-output row vector.
-
-for i = 0 to N - 1:
-    x_i = dot(Q[k, :], K[i, :]) / sqrt(D)           # Scalar logit for query k for each key vector.
-    m_{i+1} = max(m_i, x_i)                         # Update the running maximum.
-    rescaled_l_i = l_i*e^(m_i - m_{i+1})            # If prev max was the same, do nothing,
-                                                    # otherwise, correct it's exponent scale.
-
-    l_{i+1} = rescaled_l_i + e^(x_i - m_{i+1})      # Update attention row's running
-                                                    # sum's softmax denominator.
-
-    old_output_contribution = o_i * l_i * e^(m_i - m_{i+1}) / l_{i+1}
-
-        # Remove prev output's denominator l_i
-        # then correct it's exponent scale and set the newly updated denominator l_{i+1}.
-
-    o_{i+1} = old_output_contribution + (e^(x_i - m_{i+1})/l_{i+1})*V[i, :]
-
-        # Add this row vector to the running sum output row vector
-
-O[b, h, k, :] = o_N                 # Save row vector output
-
-4. FlashAttention (tiled)
-
-Unlike the previous examples, this is for the entire output rather than a row.
-Furthermore, the notation is adjusted from the paper to more closely align with
-CUDA. Furthermore, the subscript annotation is for indexing into block-level
-state rather than for state transitions like above.
-
-Divide Q, K, and V along the sequence dimension and load into shared memory 2D tiles
-of (B_r x D), (B_c x D), and (B_c x D) respectively, where (B_r, B_c) are the
-dimensions of the score tile calculated by processing the queries, keys, and values
-in the tile.
-
-Ex: Q (M x D) is composed of T_r tiles, labelled Q_i (B_r x D) by stacking along the sequence dim.
-Q = [
-    ---Q_0---
-    ---Q_1---
+S_i = [
+    S_0i
     ...
-    --- Q_{T_r - 1}
+    S_wi
 ]
 
-Through algebra similar to how online-softmax is performed, attention can be performed
-one tile at a time with a running output. Only the current Q and K/V tiles and running
-state slices need to be simultaneously loaded into SRAM.
+Because attention is independent among score rows, the score and other state such
+as m_i, l_i, and the output are all owned by the warp! So global memory
+or shared memory copies are not needed and synchronization isn't needed
+except for retrieving Q, K and V. Note: shared memory may still be used in the
+implementation but it is no longer required by the algoirthm.
 
+---
 
-This avoids us from needing to handle ops with the entire N / M elements loaded per row
-thus we don't need to materialize the (M x N) attention score matrix (self-attention has N=M).
+Algorithm:
 
+Due to independent query-row ownership between warps, shared memory for
+intermediate softmax state and output accumulators does not need to be used as
+heavily as with my FA1 implementation. Shared memory may still be used to stage
+Q/K/V tiles or rearrange matrix fragments.
+Normal CUDA can be used for element-wise operations, but optimized matrix
+multiplication should use lower-level primitives, and warp-local reductions can
+use warp shuffling.
 
-Intuition on running state:
-
-After iterating over the entire sequence / all blocks, the running output is same
-as the naive attention output. The running state m_i, l_i, and O_i lives in global
-memory between tile updates. The current tiles are loaded into SRAM, where m_i and l_i
-have one scalar per query and O_i has one D-element row per query.
-
-The m_i and l_i state must be stored as vectors, not single variables, because we do not
-actually calculate the result for one query's attention before moving onto the next; we
-incrementally build running state for a block of queries.
-
-The outer loop iterates over K/V tiles, thus for a fixed K/V tile, we iterate over all
-query tiles to calculate the running output. This is an inversion of the
-per-query output POV but is mathematically equivalent and done to keep the heavier
-data movement of the K/V tiles on the outer loop rather than inner loop.
-
+For the first implementation, shared memory can be used to make this easier.
+Thus, inter-warp operations can be done in shared memory while the rest
+will remain warp local if possible, including borrowing v1's warp reductions.
 
 Initialize:
-    B_c = floor(SRAM_capacity_elements/(4*D))   # Number of score cols and K/V rows
-                                                # processed per data tile.
-    B_r = min(B_c, D)                           # Number of score rows and Q rows
-                                                # processed per data tile.
+    B_c = 32    # Number of score cols and K/V rows
+                # processed per data tile (can be tuned).
+    B_r = 64    # Number of score rows and Q rows
+                # processed per data tile (can be tuned).
 
     T_c = ceil(N / B_c)  # Number of K/V blocks
     T_r = ceil(M / B_r)  # Number of Q blocks
 
-    # Allocate a shared-memory workspace for the current Q, K/V, score, output,
-    # and recurrence-state tiles. Allocate global-memory backing for m and l.
-    # O serves as both the output and the backing for the running output state.
+    # This represents conceptual state for one Q tile. Each warp owns the
+    # entries corresponding to one or more complete query rows.
 
-    m_i = fill(B_r, -infinity) # (B_r): Shared running maximum state for a Q tile.
-    l_i = zeros(B_r)           # (B_r): Shared running softmax denominator state.
-    O_i = zeros(B_r, D)        # (B_r x D): Shared running attention output state.
+    m_i = fill(B_r, -infinity) # (B_r): Running maximum state for a Q tile.
+    l_i = zeros(B_r)           # (B_r): Running softmax denominator state.
+    O_i = zeros(B_r, D)        # (B_r x D): Unnormalized running output state.
 
 
-# Keep K/V as the outer loop so each loaded K/V tile is reused across all query tiles.
 
-# Outer loop iterates with j, to stay consistent with flash attention paper
+# Each thread block selects rows of queries and calculates rows of O output.
+
+# -- Load shared memory 2D tile dim (B_r x D) --
+
+s_Q_i = Q[b, h, i*B_r: min((i + 1)*B_r, M), :]
+
 
 for each K/V block j = 0 to T_c - 1:
 
-    K_j = K[j*B_c: min((j + 1)*B_c, N), :]
-    V_j = V[j*B_c: min((j + 1)*B_c, N), :]
+    s_K_j = K[b, h, j*B_c: min((j + 1)*B_c, N), :]
+    s_V_j = V[b, h, j*B_c: min((j + 1)*B_c, N), :]
 
         # (B_c x D): Save up to B_c rows of K and V into SRAM.
 
-    for each Q block i = 0 to T_r - 1:
-        # -- Load shared memory 2D tile dim (B_r x D) --
-        Q_i = Q[i*B_r: min((i + 1)*B_r, M), :]
 
-            # (B_r x D): Choose up to B_r rows of Q.
+    s_S_ij = s_Q_i @ s_K_j^T / sqrt(D)
 
-        # Load this Q tile's current m_i, l_i, and O_i into shared memory, using
-        # the initialized defaults for its first update and globally saved state later.
+        # (B_r, B_c). Each warp owns one or more complete rows of S_ij.
+        # This can be in shared memory for this implementation.
 
 
-        # -- Calculate the block-local scores using SRAM --
+    w_mnew_i = max(m_i, rowmax(S_ij))
 
-        S_ij = Q_i @ K_j^T / sqrt(D)
-
-            # (B_r x B_c): S_ij is a score matrix, calculating the score for each Q
-            # row in the block by dotting with each K row in the block.
-            # A row of S_ij is only the score of a query against B_c rows of
-            # K rather than all N key rows.
-            # Note 1: The tranpose is conceptual and done by changing indexing,
-            #   rather than a separate device function call.
-            # Note 2: The rest of the work here is building a running output
-            #   from the segment S_ij which eventually yields the same result
-            #   using S.
-
-        # -- Setup block-local variables for block-local softmax --
-
-        # (this is in parallel for each query in the block).
-
-        mlocal_ij = rowmax(S_ij)
-
-            # (B_r x 1): block local rowmax to eventually calculate the running max for a query
-
-        mnew_i = max(m_i, mlocal_ij)
-
-            # (B_r): Update the vector so each element corresponds to
-            # the running max score for each query in the block
-            # By the end of the entire algorithm, m_i will contain
-            # rowmax(S), which is equivalent to what
-            # would've happened had we fully materialized S and performed
-            # rowsoftmax.
-
-        rescaled_l_i = l_i*e^(m_i - mnew_i)
-
-            # (B_r): This represents the old block local rowsoftmax's denominator
-            # prior to the contribution of this the scores using this query block.
-            # Conceptually, we are updating the a query's rowsoftmax denominator
-            # by using the scores of new K/V rows. This is confusing because
-            # we have the inner loop iterate over queries for memory performance,
-            # while I phrase these concepts from a fixed query perspective.
-            # If prev max was the same, do nothing, otherwise, correct its exponent scale
-            # to use the updated max.
-
-        new_l_i_contribution = rowsum(e^(S_ij - mnew_i))
-
-            # (B_r): Broadcast apply exp operations and subtract each row of S_ij with it's
-            # corresponding rowmax then calculate the row sum.
-            # This is this tile's contribution to the softmax denominator for
-            # each query.
-
-        lnew_i = rescaled_l_i + new_l_i_contribution
-
-            # (B_r): Update running denominator. By the end of the algorithm,
-            # l_i is the denominator for each row of rowsoftmax(S).
-
-        # -- Calculate this query block's contribution to the running output --
-
-        P_ij = exp(S_ij - mnew_i) / lnew_i
-
-            # (B_r x B_c) Calculate softmax row-wise to scale tile scores into probabilities
-            # using mnew_i and lnew_i, broadcast across their corresponding rows.
-            # For each row of S_ij, subtract with corrresponding row max then divide
-            # by corresponding denominator. Each row of S_ij again represents
-            # the score from one query when scorred against the K/V rows in this tile.
-            # Output is a 2D matrix the same size as S_ij.
-
-        new_output_contribution = P_ij  @  V_j
-
-            # (B_r x D): Conceptually, this does this:
-            # For every row of P_ij, ie for every query in the sequence tile
-            #   dot product with every value in the tile and sum them,
-            #   to effectively perform a weighted sum of probabilities.
-            # Finally, by parallelizing across B_c rows of V_j, we finish the calc
-            # for this tile.
-            # This basically means we attend each query with every key and value
-            # within our tile.
+        # (B_r). Each warp calculates the entries for its owned rows. m_i
+        # contains the running maximum from the previous K/V-tile iteration.
 
 
-        # -- Adjust running output for this query with the updated running max --
+    s_P_unscaled_ij = exp(s_S_ij - w_mnew_i)
 
-        rescaled_O_i = O_i * rescaled_l_i / lnew_i
-
-            # (B_r x D): For the running O_i matrix, update the scalars' safe
-            # softmax factors via scaling so that they are re-calculated with mnew_i.
-            # Do this by multiplying by the rescaled old denominator contribution,
-            # then dividing by the new denominator lnew_i.
+        # (B_r x B_c) Calculate running probabilities using the updated max
+        # though skip applying softmax denominator here. This can re-use
+        # S_ij allocated sram.
 
 
-        # -- Save running output for this query --
+    w_m_i_rescale_factor = exp(w_m_i - w_mnew_i)
 
-        Onew_i = rescaled_O_i + new_output_contribution
+        # (B_r): By multiplying by this constant, the exp scale of the previous
+        iteration is updated to this iteration's max. 
 
-            # (B_r x D): Sum matrices to update tile's running output
+    w_l_i = m_i_rescale_factor*l_i + rowsum(P_unscaled_ij)
 
-        # -- Save running state to global memory --
+        # (B_r): Update running denominator. By the end of the algorithm,
+        # l_i is the denominator for each row of rowsoftmax(S).
 
-        m[b, h, i*B_r: min((i + 1)*B_r, M)] = mnew_i
-        l[b, h, i*B_r: min((i + 1)*B_r, M)] = lnew_i
-        O[b, h, i*B_r: min((i + 1)*B_r, M), :] = Onew_i
+    # -- Compute running output --
 
-            # Save the updated state. O is finalized after the last K/V tile.
+    w_O_i = _O_i * m_i_rescale_factor + P_unscaled_ij @ V_j
 
-        # A future optimization is to store the O tile without the li denominator
-        # and perform the division on a second pass on the final O tile, reducing # FLOPs
-        # of needing to constantly rescale.
+        # (B_r x D): Rescale softmax numerator for running output then
+        # add this tile to the running output.
+
+    w_m_i = w_mnew_i
+
+# Apply the softmax denominator once after processing every K/V tile.
+O[b, h, i*B_r: min((i + 1)*B_r, M), :] = O_i / l_i
 
 ---
 
@@ -325,8 +205,14 @@ namespace flash_attention {
 constexpr int THREAD_BLOCK_SZ = 128;
 // TODO: Reuse SRAM buffers more tightly, then calculate B_R and B_C dynamically.
 // Data tile size != thread block size
-constexpr std::size_t B_r = 32;
-constexpr std::size_t B_c = 32;
+constexpr std::size_t B_r = 64;
+constexpr std::size_t B_c = 128;
+constexpr std::size_t WARP_SIZE = 32;
+static_assert(THREAD_BLOCK_SZ % WARP_SIZE == 0,
+              "Thread block size must contain a whole number of warps");
+constexpr std::size_t NUM_WARPS = THREAD_BLOCK_SZ / WARP_SIZE;
+static_assert(B_r % NUM_WARPS == 0, "Q rows must divide evenly among warps");
+constexpr std::size_t ROWS_PER_WARP = B_r / NUM_WARPS;
 
 enum class ReductionOp : std::uint8_t { SUM, MAX };
 enum class RhsAccess : std::uint8_t { ROW, COLUMN };
@@ -362,21 +248,6 @@ struct TileParams {
         this->sScore_offset = offset;
         offset += B_r * B_c;
 
-        this->sM_offset = offset;
-        offset += B_r;
-
-        this->sL_offset = offset;
-        offset += B_r;
-
-        this->sO_offset = offset;
-        offset += B_r * D;
-
-        this->sMnew_offset = offset;
-        offset += B_r;
-
-        this->sLrescaled_offset = offset;
-        offset += B_r;
-
         this->total_elements = offset;
 
         this->total_bytes = offset * sizeof(float);
@@ -389,11 +260,6 @@ struct TileParams {
     std::size_t sK_offset;         // [B_c, D]
     std::size_t sV_offset;         // [B_c, D]
     std::size_t sScore_offset;     // [B_r, B_c]. Can be re-used for P_ij.
-    std::size_t sM_offset;         // [B_r]
-    std::size_t sL_offset;         // [B_r]
-    std::size_t sO_offset;         // [B_r, D]
-    std::size_t sMnew_offset;      // [B_r]
-    std::size_t sLrescaled_offset; // [B_r]
     std::size_t total_elements;
     std::size_t total_bytes;
 };
@@ -403,8 +269,6 @@ struct FlashForwardKernelParams {
     const float *const gK;          // [B, H, N, D] Global memory key pointer.
     const float *const gV;          // [B, H, N, D] Global memory value pointer.
     float *const gO;                // [B, H, M, D] Global memory output pointer.
-    float *const gM;                // [B, H, M] Global memory running-max pointer.
-    float *const gL;                // [B, H, M] Global memory normalizer pointer.
     const std::size_t B;            // Batch size.
     const std::size_t H;            // Number of heads.
     const std::size_t M;            // Query sequence length.
@@ -414,14 +278,20 @@ struct FlashForwardKernelParams {
 };
 
 /**
- * Returns the flat offset for the batch and head selected by blockIdx.
+ * Returns the flat offset for a row tile within the batch and head selected by
+ * blockIdx.x and blockIdx.y. Pass blockIdx.z for a Q/O tile and the K/V-loop
+ * index for a K/V tile.
  */
-__device__ __forceinline__ std::size_t get_batch_head_offset(const std::size_t num_heads,
-                                                             const std::size_t total_rows,
-                                                             const std::size_t total_cols) {
+__device__ __forceinline__ std::size_t get_tile_offset(const std::size_t num_heads,
+                                                       const std::size_t total_rows,
+                                                       const std::size_t total_cols,
+                                                       const std::size_t tile_rows,
+                                                       const std::size_t tile_idx) {
     const std::size_t batch_idx = static_cast<std::size_t>(blockIdx.x);
     const std::size_t head_idx = static_cast<std::size_t>(blockIdx.y);
-    return (batch_idx * num_heads + head_idx) * total_rows * total_cols;
+    const std::size_t batch_head_offset =
+        (batch_idx * num_heads + head_idx) * total_rows * total_cols;
+    return batch_head_offset + tile_idx * tile_rows * total_cols;
 }
 
 /**
@@ -443,7 +313,8 @@ __device__ void load_shared_tile(float *const smem_ptr,
                                  const float pad = 0.0F) {
     const std::size_t s_tile_size = tile_rows * total_cols;
     const std::size_t g_tile_start = tile_i * tile_rows;
-    const std::size_t batch_head_offset = get_batch_head_offset(H, total_rows, total_cols);
+    const std::size_t g_tile_offset =
+        get_tile_offset(H, total_rows, total_cols, tile_rows, tile_i);
 
     for (std::size_t flattened_i = static_cast<std::size_t>(threadIdx.x); flattened_i < s_tile_size;
          flattened_i += blockDim.x) {
@@ -454,7 +325,7 @@ __device__ void load_shared_tile(float *const smem_ptr,
         // Convert tile row into global row
         const std::size_t g_row = g_tile_start + s_row;
         if (g_row < total_rows) {
-            const std::size_t g_idx = batch_head_offset + (g_row * total_cols) + col;
+            const std::size_t g_idx = g_tile_offset + (s_row * total_cols) + col;
             smem_ptr[flattened_i] = gmem_ptr[g_idx];
         } else {
             smem_ptr[flattened_i] = pad;
@@ -480,7 +351,8 @@ __device__ void save_shared_tile(const float *const smem_ptr,
                                  const std::size_t tile_i) {
     const std::size_t s_tile_size = tile_rows * total_cols;
     const std::size_t g_tile_start = tile_i * tile_rows;
-    const std::size_t batch_head_offset = get_batch_head_offset(H, total_rows, total_cols);
+    const std::size_t g_tile_offset =
+        get_tile_offset(H, total_rows, total_cols, tile_rows, tile_i);
 
     for (std::size_t flattened_i = static_cast<std::size_t>(threadIdx.x); flattened_i < s_tile_size;
          flattened_i += blockDim.x) {
@@ -491,49 +363,10 @@ __device__ void save_shared_tile(const float *const smem_ptr,
         // Convert tile row into global row
         const std::size_t g_row = g_tile_start + s_row;
         if (g_row < total_rows) {
-            const std::size_t g_idx = batch_head_offset + (g_row * total_cols) + col;
+            const std::size_t g_idx = g_tile_offset + (s_row * total_cols) + col;
             gmem_ptr[g_idx] = smem_ptr[flattened_i];
         }
     }
-}
-
-/**
- * Cooperatively fills a contiguous shared-memory tile with a scalar value.
- */
-__device__ __forceinline__ void set_smem(float *const smem_ptr,
-                                         const std::size_t num_elements,
-                                         const float value) {
-    for (std::size_t i = static_cast<std::size_t>(threadIdx.x); i < num_elements;
-         i += static_cast<std::size_t>(blockDim.x)) {
-        smem_ptr[i] = value;
-    }
-}
-
-/**
- * Initializes row vector m_i [B_r] in shared memory to -infinity.
- */
-__device__ float *init_M_i_neginf(const FlashForwardKernelParams &p, float *const smem_ptr) {
-    float *const sM_i = smem_ptr + p.tile.sM_offset;
-    set_smem(sM_i, B_r, -std::numeric_limits<float>::infinity());
-    return sM_i;
-}
-
-/**
- * Initializes row vector l_i [B_r] in shared memory to zero.
- */
-__device__ float *init_L_i_zero(const FlashForwardKernelParams &p, float *const smem_ptr) {
-    float *const sL_i = smem_ptr + p.tile.sL_offset;
-    set_smem(sL_i, B_r, 0.0F);
-    return sL_i;
-}
-
-/**
- * Initializes O_i [B_r, D] in shared memory to zero.
- */
-__device__ float *init_O_i_zero(const FlashForwardKernelParams &p, float *const smem_ptr) {
-    float *const sO_i = smem_ptr + p.tile.sO_offset;
-    set_smem(sO_i, B_r * p.D, 0.0F);
-    return sO_i;
 }
 
 /**
@@ -567,72 +400,6 @@ __device__ float *load_V_j(const FlashForwardKernelParams &p,
     float *const sV_j = smem_ptr + p.tile.sV_offset;
     load_shared_tile(sV_j, p.gV, p.H, p.N, p.D, B_c, tile_j);
     return sV_j;
-}
-
-/**
- * Loads row vector m_i [B_r] from m [B, H, M], padding with -infinity.
- */
-__device__ float *load_M_i(const FlashForwardKernelParams &p,
-                           float *const smem_ptr,
-                           std::size_t tile_i) {
-    float *const sM_i = smem_ptr + p.tile.sM_offset;
-    // total_cols == 1 since m_i is 1D
-    load_shared_tile(sM_i, p.gM, p.H, p.M, std::size_t{1}, B_r, tile_i,
-                     -std::numeric_limits<float>::infinity());
-    return sM_i;
-}
-
-/**
- * Loads row vector l_i [B_r] from l [B, H, M], padding with zero.
- */
-__device__ float *load_L_i(const FlashForwardKernelParams &p,
-                           float *const smem_ptr,
-                           std::size_t tile_i) {
-    float *const sL_i = smem_ptr + p.tile.sL_offset;
-    // total_cols == 1 since l_i is 1D
-    load_shared_tile(sL_i, p.gL, p.H, p.M, std::size_t{1}, B_r, tile_i);
-    return sL_i;
-}
-
-/**
- * Loads O_i [B_r, D] from O [B, H, M, D].
- */
-__device__ float *load_O_i(const FlashForwardKernelParams &p,
-                           float *const smem_ptr,
-                           std::size_t tile_i) {
-    float *const sO_i = smem_ptr + p.tile.sO_offset;
-    load_shared_tile(sO_i, p.gO, p.H, p.M, p.D, B_r, tile_i);
-    return sO_i;
-}
-
-/**
- * Saves updated m_i [B_r] from shared memory to m [B, H, M].
- */
-__device__ void save_M_i(const FlashForwardKernelParams &p,
-                         const float *const smem_ptr,
-                         std::size_t tile_i) {
-    const float *const sM_i = smem_ptr + p.tile.sMnew_offset;
-    save_shared_tile(sM_i, p.gM, p.H, p.M, std::size_t{1}, B_r, tile_i);
-}
-
-/**
- * Saves updated l_i [B_r] from shared memory to l [B, H, M].
- */
-__device__ void save_L_i(const FlashForwardKernelParams &p,
-                         const float *const smem_ptr,
-                         std::size_t tile_i) {
-    const float *const sL_i = smem_ptr + p.tile.sL_offset;
-    save_shared_tile(sL_i, p.gL, p.H, p.M, std::size_t{1}, B_r, tile_i);
-}
-
-/**
- * Saves updated O_i [B_r, D] from shared memory to O [B, H, M, D].
- */
-__device__ void save_O_i(const FlashForwardKernelParams &p,
-                         const float *const smem_ptr,
-                         std::size_t tile_i) {
-    const float *const sO_i = smem_ptr + p.tile.sO_offset;
-    save_shared_tile(sO_i, p.gO, p.H, p.M, p.D, B_r, tile_i);
 }
 
 /**
@@ -902,7 +669,7 @@ __global__ void forward(FlashForwardKernelParams p) {
 /**
  * Allocates the running softmax state and launches the tiled attention kernel.
  */
-void flash_forward_v1_cuda_launch(const float *gQ,
+void flash_forward_v2_cuda_launch(const float *gQ,
                                   const float *gK,
                                   const float *gV,
                                   float *gO,
@@ -912,27 +679,11 @@ void flash_forward_v1_cuda_launch(const float *gQ,
                                   int N,
                                   int D) {
 
-    // Q, K, and V inputs and the O output are already allocated in global memory.
-    // O also serves as the persistent running output state.
-    // S_ij is temporary on-chip storage and is reused in place as P_ij.
-    // Therefore, only the full m and l arrays [B, H, M] need new global allocations.
-    // Their current tiles m_i and l_i are loaded on chip and written back between
-    // K/V-tile iterations because all query-row state cannot fit on chip at once.
-
-    float *gM;
-    float *gL;
-    const std::size_t state_elements =
-        static_cast<std::size_t>(B) * static_cast<std::size_t>(H) * static_cast<std::size_t>(M);
-    cudaMalloc(&gM, state_elements * sizeof(float));
-    cudaMalloc(&gL, state_elements * sizeof(float));
-
     FlashForwardKernelParams p{
         gQ,
         gK,
         gV,
         gO,
-        gM,
-        gL,
         static_cast<std::size_t>(B),
         static_cast<std::size_t>(H),
         static_cast<std::size_t>(M),
@@ -941,14 +692,15 @@ void flash_forward_v1_cuda_launch(const float *gQ,
     };
 
     dim3 block{THREAD_BLOCK_SZ};
-    // Grid for [B, H, N, D] outputs: (D tiles, N tiles, B * H).
-    dim3 grid{static_cast<unsigned int>(B), static_cast<unsigned int>(H)};
+    const std::size_t query_tiles =
+        detail::ceil_div<std::size_t>(static_cast<std::size_t>(M), B_r);
+    // One block per (batch, head, Q tile).
+    dim3 grid{static_cast<unsigned int>(B),
+              static_cast<unsigned int>(H),
+              static_cast<unsigned int>(query_tiles)};
 
     forward<<<grid, block, p.tile.total_bytes>>>(p);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    cudaFree(gM);
-    cudaFree(gL);
 }
 
 } // namespace flash_attention

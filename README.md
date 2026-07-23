@@ -1,7 +1,7 @@
 # FlashAttention
 
-Pedagogical project for building handwritten CUDA attention kernels. PyTorch provides the Python
-binding and correctness reference.
+Pedagogical project implementing multi-head attention forward passes with handwritten CUDA kernels.
+Surrounding infrastructure (profiling script, PyTorch binding etc) is not hand-written.
 
 ## Usage
 
@@ -23,9 +23,10 @@ out = flash_attention_v1.forward(q, k, v)
 | Baseline | Explicit PyTorch matmul, scaling, softmax, and matmul | Correctness and latency reference |
 | V0 | Unfused CUDA kernels that materialize the attention matrix | Naive CUDA starting point |
 | V1 | One fused CUDA kernel with tiled online softmax | First FlashAttention-style implementation |
+| V2 | Copy of the v1 fused kernel | Starting point for FlashAttention-2-style work partitioning |
 
 The CUDA implementations accept contiguous CUDA `float32` tensors. V0 requires self-attention
-with `M = N`; V1 accepts Q `[B, H, M, D]` and K/V `[B, H, N, D]`.
+with `M = N`; V1 and V2 accept Q `[B, H, M, D]` and K/V `[B, H, N, D]`.
 
 ## Results
 
@@ -67,12 +68,15 @@ V0 is slower than the PyTorch baseline despite using tiled CUDA kernels.
 
 #### V1
 
-V1 avoids the full attention matrix, but one block per `(batch, head)` produces only 48 blocks, so
-some of the RTX 4080's 76 SMs receive no work. Shared memory caps residency at eight theoretical
-warps per SM; the kernel achieves four.
+V1 follows the FA1 and avoids the full attention matrix, avoids unnecessary transposes, and performs warp reductions but one of the main issues is it's grid setup. It uses block per `(batch, head)` which produces only 48 blocks for the benchmarked shape, so some of the RTX 4080's 76 SMs receive no work. In fact ideally, we have more than 76 blocks running at a time. As for occupancy, shared memory caps residency at eight theoretical
+warps per SM while the kernel achieves four.
 
 The next architectural step is to parallelize independent query tiles, following the
 FlashAttention-2 work partition rather than tuning the current 48-block launch.
+
+#### V2
+
+V2 begins as a copy of V1 and is the starting point for query-tile parallelism.
 
 ## Setup
 
