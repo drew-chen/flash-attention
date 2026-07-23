@@ -16,29 +16,21 @@ v = torch.randn_like(q)
 out = flash_attention_v1.forward(q, k, v)
 ```
 
-## Implementations
+## Results
 
-| Version | Design | Purpose |
-| --- | --- | --- |
-| Baseline | Explicit PyTorch matmul, scaling, softmax, and matmul | Correctness and latency reference |
-| V0 | Unfused CUDA kernels that materialize the attention matrix | Naive CUDA starting point |
-| V1 | One fused CUDA kernel with tiled online softmax | First FlashAttention-style implementation |
-| V2 | Copy of the v1 fused kernel | Starting point for FlashAttention-2-style work partitioning |
+Primary shape: `B=4, H=12, M=N=2048, D=64, dtype=float32` (all implementations are non-causal).
+
+### Implementations and latency
+
+| Version | Latency (µs) | Δ vs. baseline | Design |
+| --- | ---: | ---: | --- |
+| Baseline | 9295.93 | — | Explicit PyTorch attention; correctness and latency reference |
+| V0 | 36074.19 | +288.1% | Unfused kernels that materialize attention; naive CUDA starting point |
+| V1 | 182577.85 | +1864.1% | Fused tiled online softmax; first FlashAttention-style implementation |
+| V2 | 103111.38 | +1009.2% | FA2-style query/warp partitioning with shared state; warp-local optimization starting point |
 
 The CUDA implementations accept contiguous CUDA `float32` tensors. V0 requires self-attention
 with `M = N`; V1 and V2 accept Q `[B, H, M, D]` and K/V `[B, H, N, D]`.
-
-## Results
-
-Primary shape: `B=4, H=12, M=N=2048, D=64, dtype=float32, causal=false`.
-
-### Latency
-
-| Version | Latency (µs) | Δ vs. baseline |
-| --- | ---: | ---: |
-| Baseline | 8418.95 | — |
-| V0 | 33890.02 | +302.5% |
-| V1 | 172278.32 | +1946.3% |
 
 ### V1 profiling
 
@@ -52,6 +44,19 @@ The fused v1 kernel was profiled on an original RTX 4080:
 | Occupancy | 8.33% achieved | 16.67% theoretical |
 | Grid | 48 blocks | 76 SMs |
 | Shared memory | 38.40 KB/block | Limits residency to 2 blocks/SM |
+
+### V2 profiling
+
+The fused v2 kernel was profiled on the same GPU:
+
+| Metric | Measured | RTX 4080 reference |
+| --- | ---: | ---: |
+| FP32 throughput | 0.562 TFLOP/s | 48.7 TFLOP/s peak |
+| DRAM bandwidth | 9.10 GB/s | 716.8 GB/s peak |
+| Arithmetic intensity | 61.70 FLOP/byte | 67.9 FLOP/byte ridge point |
+| Occupancy | 8.33% achieved | 8.33% theoretical |
+| Grid | 1,536 blocks | 76 SMs |
+| Shared memory | 58.37 KB/block | Limits residency to 1 block/SM |
 
 The hardware references come from NVIDIA's
 [Ada GPU architecture whitepaper](https://images.nvidia.com/aem-dam/Solutions/Data-Center/l4/nvidia-ada-gpu-architecture-whitepaper-V2.02.pdf).
@@ -76,7 +81,18 @@ FlashAttention-2 work partition rather than tuning the current 48-block launch.
 
 #### V2
 
-V2 begins as a copy of V1 and is the starting point for query-tile parallelism.
+V2 adds FA2-style query-tile parallelism and assigns complete score rows to
+warps, increasing the benchmark grid from 48 to 1,536 blocks. However, this
+simplified implementation does not completely follow FA2's warp-local storage
+strategy. It keeps `m`, `l`, `O`, and temporary softmax state in shared memory
+alongside the Q/K/V and S/P tiles.
+
+The resulting 58.37 KB shared-memory allocation permits only one 128-thread
+block, or four active warps, per SM. This limits both theoretical and achieved
+occupancy to 8.33%. A more complete FA2 implementation would keep the running
+softmax state and output accumulators in warp/thread registers, reuse shared
+buffers more aggressively, and reserve shared memory primarily for staging
+matrix tiles.
 
 ## Setup
 
@@ -116,6 +132,18 @@ python benchmark.py
 
 The fixed suite measures `M=N=512, 1024, 2048` at `B=4, H=12, D=64`, using 25 warmups and 100
 timed calls.
+
+The shape and timing counts can be overridden for larger, shorter benchmark runs:
+
+```bash
+python benchmark.py \
+  --batch-size 1 \
+  --num-heads 32 \
+  --head-dim 64 \
+  --seq-lens 4096 \
+  --warmup 5 \
+  --repetitions 10
+```
 
 ## Profiling
 

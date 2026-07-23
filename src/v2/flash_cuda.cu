@@ -195,9 +195,12 @@ O[b, h, i*B_r: min((i + 1)*B_r, M), :] = O_i / l_i
 
 ---
 
-In the following impl, variables are named similar to the FA1 paper
-and s prefix means shared mem ptr, g prefix means global mem ptr,
-and finally _i means a subscript of i.
+The following implementation is a simplified version of FA2. For ease of
+implementation, it stores some state in shared memory even where FA2's
+warp-local ownership would allow that state to remain in registers.
+
+Variables are named similar to the FA1 paper: the s prefix means shared mem
+ptr, the g prefix means global mem ptr, and _i means a subscript of i.
 */
 
 namespace flash_attention {
@@ -206,13 +209,12 @@ constexpr int THREAD_BLOCK_SZ = 128;
 // TODO: Reuse SRAM buffers more tightly, then calculate B_R and B_C dynamically.
 // Data tile size != thread block size
 constexpr std::size_t B_r = 64;
-constexpr std::size_t B_c = 128;
+constexpr std::size_t B_c = 32;
 constexpr std::size_t WARP_SIZE = 32;
 static_assert(THREAD_BLOCK_SZ % WARP_SIZE == 0,
               "Thread block size must contain a whole number of warps");
 constexpr std::size_t NUM_WARPS = THREAD_BLOCK_SZ / WARP_SIZE;
 static_assert(B_r % NUM_WARPS == 0, "Q rows must divide evenly among warps");
-constexpr std::size_t ROWS_PER_WARP = B_r / NUM_WARPS;
 
 enum class ReductionOp : std::uint8_t { SUM, MAX };
 enum class RhsAccess : std::uint8_t { ROW, COLUMN };
@@ -231,7 +233,7 @@ struct TileParams {
         C10_CUDA_CHECK(cudaGetDevice(&device));
 
         int max_smem_bytes;
-        C10_CUDA_CHECK(cudaDeviceGetAttribute(&max_smem_bytes, cudaDevAttrMaxSharedMemoryPerBlock,
+        C10_CUDA_CHECK(cudaDeviceGetAttribute(&max_smem_bytes, cudaDevAttrMaxSharedMemoryPerBlockOptin,
                                               device));
 
         std::size_t offset = 0;
@@ -248,6 +250,21 @@ struct TileParams {
         this->sScore_offset = offset;
         offset += B_r * B_c;
 
+        this->sM_offset = offset;
+        offset += B_r;
+
+        this->sL_offset = offset;
+        offset += B_r;
+
+        this->sO_offset = offset;
+        offset += B_r * D;
+
+        this->sMnew_offset = offset;
+        offset += B_r;
+
+        this->sLrescaled_offset = offset;
+        offset += B_r;
+
         this->total_elements = offset;
 
         this->total_bytes = offset * sizeof(float);
@@ -260,6 +277,11 @@ struct TileParams {
     std::size_t sK_offset;         // [B_c, D]
     std::size_t sV_offset;         // [B_c, D]
     std::size_t sScore_offset;     // [B_r, B_c]. Can be re-used for P_ij.
+    std::size_t sM_offset;         // [B_r]
+    std::size_t sL_offset;         // [B_r]
+    std::size_t sO_offset;         // [B_r, D]
+    std::size_t sMnew_offset;      // [B_r]
+    std::size_t sLrescaled_offset; // [B_r]
     std::size_t total_elements;
     std::size_t total_bytes;
 };
@@ -480,10 +502,10 @@ template <ReductionOp Op> __device__ float warp_reduce(float initial_value) {
  * Calculates the row-wise max of m_i [B_r] and S_ij [B_r, B_c].
  * Returns the sMnew_i [B_r] shared-memory result.
  */
-__device__ float *rowmax(const FlashForwardKernelParams &p,
-                         float *const smem_ptr,
-                         const float *const sM_i,
-                         const float *const sScore_ij) {
+__device__ float *warp_rowmax(const FlashForwardKernelParams &p,
+                              float *const smem_ptr,
+                              const float *const sM_i,
+                              const float *const sScore_ij) {
     static_assert(B_c == 32, "Warp reduction assumes one warp fits one row");
     float *const sMnew_i = smem_ptr + p.tile.sMnew_offset;
     const std::size_t initial_row = threadIdx.x / 32;
@@ -544,15 +566,14 @@ __device__ void add_Lnew_i_contribution(float *const sL_i,
 }
 
 /**
- * Mutates the score [B_r, B_c] to calculate the running probabilites
- * softmax exp(S_ij - mnew_i) / lnew_i.
+ * Mutates the score [B_r, B_c] to calculate unnormalized probabilities
+ * exp(S_ij - mnew_i).
  */
-__device__ void softmax(const FlashForwardKernelParams &p,
-                        float *const sScore_ij,
-                        const float *const sLnew_i,
-                        const float *const sMnew_i,
-                        const std::size_t tile_i,
-                        const std::size_t tile_j) {
+__device__ void compute_unscaled_P_ij(const FlashForwardKernelParams &p,
+                                      float *const sScore_ij,
+                                      const float *const sMnew_i,
+                                      const std::size_t tile_i,
+                                      const std::size_t tile_j) {
     for (std::size_t flattened_score_idx = threadIdx.x; flattened_score_idx < B_r * B_c;
          flattened_score_idx += blockDim.x) {
 
@@ -564,7 +585,7 @@ __device__ void softmax(const FlashForwardKernelParams &p,
         // Technically the col bounds check is redundant due to S_ij's -inf padding.
         if (global_row < p.M && global_col < p.N) {
             sScore_ij[(row * B_c) + col] =
-                expf(sScore_ij[(row * B_c) + col] - sMnew_i[row]) / sLnew_i[row];
+                expf(sScore_ij[(row * B_c) + col] - sMnew_i[row]);
         } else {
             sScore_ij[(row * B_c) + col] = 0;
         }
@@ -572,24 +593,21 @@ __device__ void softmax(const FlashForwardKernelParams &p,
 }
 
 /**
- * Mutates running output sO_i [B_r, D] to have the updated softmax scaling
- * O_i * rescaled_l_i / lnew_i.
+ * Rescales the unnormalized running output when the running maximum changes.
  */
-__device__ void rescale_O_i(const FlashForwardKernelParams &p,
-                            float *const sO_i,
-                            const float *const sLrescaled_i,
-                            const float *const sLnew_i,
-                            const std::size_t tile_i) {
-    for (std::size_t flattened_output_idx = threadIdx.x; flattened_output_idx < B_r * p.D;
-         flattened_output_idx += blockDim.x) {
-
-        const std::size_t row = flattened_output_idx / p.D;
+__device__ void warp_rescale_O_i(const FlashForwardKernelParams &p,
+                                 float *const sO_i,
+                                 const float *const sM_i,
+                                 const float *const sMnew_i,
+                                 const std::size_t tile_i) {
+    const std::size_t warp = threadIdx.x / WARP_SIZE;
+    const std::size_t lane = threadIdx.x % WARP_SIZE;
+    for (std::size_t row = warp; row < B_r; row += NUM_WARPS) {
         const std::size_t global_row = (tile_i * B_r) + row;
-        if (global_row < p.M) {
-            sO_i[flattened_output_idx] =
-                sO_i[flattened_output_idx] * sLrescaled_i[row] / sLnew_i[row];
-        } else {
-            sO_i[flattened_output_idx] = 0.0F;
+        const float scale = expf(sM_i[row] - sMnew_i[row]);
+        for (std::size_t col = lane; col < p.D; col += WARP_SIZE) {
+            sO_i[row * p.D + col] =
+                global_row < p.M ? sO_i[row * p.D + col] * scale : 0.0F;
         }
     }
 }
@@ -597,73 +615,73 @@ __device__ void rescale_O_i(const FlashForwardKernelParams &p,
 /**
  * Mutates sO_rescaled to have this tile's output contribution P_ij @ V_j + rescaled O_i [B_r, D].
  */
-__device__ void add_Onew_i_contribution(const FlashForwardKernelParams &p,
-                                        float *const sO_rescaled_i,
-                                        const float *const sP_ij,
-                                        const float *const sV_j) {
-    for (std::size_t flattened_output_idx = threadIdx.x; flattened_output_idx < B_r * p.D;
-         flattened_output_idx += blockDim.x) {
-        const std::size_t row = flattened_output_idx / p.D;
-        const std::size_t col = flattened_output_idx % p.D;
-        sO_rescaled_i[flattened_output_idx] +=
-            scaled_dotprod<RhsAccess::COLUMN>(sP_ij, sV_j, row, col, p.D, B_c);
+__device__ void warp_accumulate_O_i(const FlashForwardKernelParams &p,
+                                    float *const sO_rescaled_i,
+                                    const float *const sP_ij,
+                                    const float *const sV_j) {
+    const std::size_t warp = threadIdx.x / WARP_SIZE;
+    const std::size_t lane = threadIdx.x % WARP_SIZE;
+    for (std::size_t row = warp; row < B_r; row += NUM_WARPS) {
+        for (std::size_t col = lane; col < p.D; col += WARP_SIZE) {
+            sO_rescaled_i[(row * p.D) + col] +=
+                scaled_dotprod<RhsAccess::COLUMN>(sP_ij, sV_j, row, col, p.D, B_c);
+        }
     }
 }
 
 /**
- * Calculates one (batch, head) of attention output per block using algorithm 4.
+ * Calculates one query tile of attention output per block.
  */
 __global__ void forward(FlashForwardKernelParams p) {
-    // This must be partitioned into Q_i, K_j, etc using p.tile
     extern __shared__ float smem[];
 
-    const std::size_t T_r = detail::ceil_div<std::size_t>(p.M, B_r);
     const std::size_t T_c = detail::ceil_div<std::size_t>(p.N, B_c);
+    const std::size_t i = blockIdx.z;
+
+    float *sQ_i = load_Q_i(p, smem, i);
+    float *sO_i = smem + p.tile.sO_offset;
+    float *sM_i = smem + p.tile.sM_offset;
+    float *sL_i = smem + p.tile.sL_offset;
+    for (std::size_t idx = threadIdx.x; idx < B_r * p.D; idx += blockDim.x) {
+        sO_i[idx] = 0.0F;
+    }
+    if (threadIdx.x < B_r) {
+        sM_i[threadIdx.x] = -std::numeric_limits<float>::infinity();
+        sL_i[threadIdx.x] = 0.0F;
+    }
+    __syncthreads();
 
     for (std::size_t j = 0; j < T_c; j++) {
         float *sK_j = load_K_j(p, smem, j);
         float *sV_j = load_V_j(p, smem, j);
+        __syncthreads();
+        float *sScore_ij = score_ij(p, smem, sQ_i, sK_j, j);
+        __syncthreads();
+        float *sMnew_i = warp_rowmax(p, smem, sM_i, sScore_ij);
+        __syncthreads();
+        float *sLrescaled_i = rescale_L_i(p, smem, sL_i, sM_i, sMnew_i);
+        __syncthreads();
+        add_Lnew_i_contribution(sL_i, sScore_ij, sLrescaled_i, sMnew_i);
+        compute_unscaled_P_ij(p, sScore_ij, sMnew_i, i, j);
+        __syncthreads();
+        warp_rescale_O_i(p, sO_i, sM_i, sMnew_i, i);
+        __syncthreads();
+        warp_accumulate_O_i(p, sO_i, sScore_ij, sV_j);
+        if (threadIdx.x < B_r) {
+            sM_i[threadIdx.x] = sMnew_i[threadIdx.x];
+        }
+        __syncthreads();
+    }
 
-        for (std::size_t i = 0; i < T_r; i++) {
-            float *sQ_i = load_Q_i(p, smem, i);
-            float *sO_i;
-            float *sM_i;
-            float *sL_i;
-
-            if (j == 0) {
-                sO_i = init_O_i_zero(p, smem);
-                sM_i = init_M_i_neginf(p, smem);
-                sL_i = init_L_i_zero(p, smem);
-            } else {
-                sO_i = load_O_i(p, smem, i);
-                sM_i = load_M_i(p, smem, i);
-                sL_i = load_L_i(p, smem, i);
-            }
-            __syncthreads();
-            float *sScore_ij = score_ij(p, smem, sQ_i, sK_j, j);
-            __syncthreads();
-            float *sMnew_i = rowmax(p, smem, sM_i, sScore_ij);
-            __syncthreads();
-            float *sLrescaled_i = rescale_L_i(p, smem, sL_i, sM_i, sMnew_i);
-            __syncthreads();
-            // sL_i is mutated to contain sLnew_i
-            add_Lnew_i_contribution(sL_i, sScore_ij, sLrescaled_i, sMnew_i);
-            __syncthreads();
-            // Use sL_i as sLnew_i and mutate S_ij to contain P_ij
-            softmax(p, sScore_ij, sL_i, sMnew_i, i, j);
-            __syncthreads();
-            float *sP_ij = sScore_ij;
-            // sO_i is mutated to contain rescaled_O_i
-            rescale_O_i(p, sO_i, sLrescaled_i, sL_i, i);
-            __syncthreads();
-            add_Onew_i_contribution(p, sO_i, sP_ij, sV_j);
-            __syncthreads();
-            save_M_i(p, smem, i);
-            save_L_i(p, smem, i);
-            save_O_i(p, smem, i);
-            __syncthreads();
+    const std::size_t warp = threadIdx.x / WARP_SIZE;
+    const std::size_t lane = threadIdx.x % WARP_SIZE;
+    for (std::size_t row = warp; row < B_r; row += NUM_WARPS) {
+        for (std::size_t col = lane; col < p.D; col += WARP_SIZE) {
+            sO_i[(row * p.D) + col] /= sL_i[row];
         }
     }
+    __syncthreads();
+    save_shared_tile(sO_i, p.gO, p.H, p.M, p.D, B_r, i);
 }
 
 /**
@@ -690,6 +708,9 @@ void flash_forward_v2_cuda_launch(const float *gQ,
         static_cast<std::size_t>(N),
         static_cast<std::size_t>(D),
     };
+
+    C10_CUDA_CHECK(cudaFuncSetAttribute(forward, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        static_cast<int>(p.tile.total_bytes)));
 
     dim3 block{THREAD_BLOCK_SZ};
     const std::size_t query_tiles =
