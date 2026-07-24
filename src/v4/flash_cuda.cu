@@ -39,8 +39,12 @@ few lower-level optimizations:
    use different shared-memory banks. V still reuses this allocation with its
    normal row-major layout.
 
-3. Force-inline the small device stages. Loops are not forced to unroll because
+3. Force-inline several small device stages. Loops are not forced to unroll because
    that increased register use and made the kernel slower.
+
+4. Use 32-bit int values for bounded tile, row, warp, lane, and loop indices to
+   avoid unnecessary 64-bit arithmetic in hot loops. Global tensor offsets stay
+   std::size_t and are widened explicitly after the bounded index calculations.
 
 Like V3, the kernel aims to fit at least two blocks per SM and does not use
 tensor cores or an asynchronous pipeline.
@@ -55,18 +59,18 @@ ptr, the g prefix means global mem ptr, and _i means a subscript of i.
 namespace flash_attention {
 namespace {
 
-constexpr std::size_t B_r = 64;
-constexpr std::size_t B_c = 32;
-constexpr std::size_t WARP_SIZE = 32;
+constexpr int B_r = 64;
+constexpr int B_c = 32;
+constexpr int WARP_SIZE = 32;
 
-constexpr std::size_t HEAD_DIM = 64;
+constexpr int HEAD_DIM = 64;
 // 1 / sqrt(HEAD_DIM) for the D=64 specialization.
 constexpr float SOFTMAX_SCALE = 1.0F / 8.0F;
 // A stride of 65 makes lanes reading one K column use different shared-memory banks.
-constexpr std::size_t K_SHARED_STRIDE = HEAD_DIM + 1;
+constexpr int K_SHARED_STRIDE = HEAD_DIM + 1;
 constexpr int THREAD_BLOCK_SZ = 256;
-constexpr std::size_t NUM_WARPS = THREAD_BLOCK_SZ / WARP_SIZE;
-constexpr std::size_t ROWS_PER_WARP = B_r / NUM_WARPS;
+constexpr int NUM_WARPS = THREAD_BLOCK_SZ / WARP_SIZE;
+constexpr int ROWS_PER_WARP = B_r / NUM_WARPS;
 static_assert(HEAD_DIM == 64, "V4 is specialized for D=64");
 static_assert(THREAD_BLOCK_SZ % WARP_SIZE == 0,
               "V4 thread block size must contain a whole number of warps");
@@ -74,14 +78,19 @@ static_assert(B_r % NUM_WARPS == 0, "V4 Q rows must divide evenly among warps");
 
 enum class ReductionOp : std::uint8_t { SUM, MAX };
 
-// Activates all warps in a warp shuffle (all bits 1).
+// Activates all lanes in a warp shuffle (all bits 1).
 constexpr unsigned FULL_WARP_MASK = ~0U;
 
+// Keep bounded tile, row, and lane arithmetic 32-bit. Widen explicitly to
+// std::size_t only when forming global-memory offsets.
 struct TileParams {
     static constexpr std::size_t sQ_offset = 0;
-    static constexpr std::size_t sKV_shared_offset = sQ_offset + (B_r * HEAD_DIM);
-    static constexpr std::size_t sP_offset = sKV_shared_offset + (B_c * K_SHARED_STRIDE);
-    static constexpr std::size_t total_elements = sP_offset + (B_r * B_c);
+    static constexpr std::size_t sKV_shared_offset =
+        sQ_offset + (static_cast<std::size_t>(B_r) * HEAD_DIM);
+    static constexpr std::size_t sP_offset =
+        sKV_shared_offset + (static_cast<std::size_t>(B_c) * K_SHARED_STRIDE);
+    static constexpr std::size_t total_elements =
+        sP_offset + (static_cast<std::size_t>(B_r) * B_c);
     static constexpr std::size_t total_bytes = total_elements * sizeof(float);
 };
 
@@ -90,9 +99,9 @@ struct FlashForwardKernelParams {
     const float *const gK; // [B, H, N, 64] Global memory key pointer.
     const float *const gV; // [B, H, N, 64] Global memory value pointer.
     float *const gO;       // [B, H, M, 64] Global memory output pointer.
-    const std::size_t H;   // Number of heads.
-    const std::size_t M;   // Query sequence length.
-    const std::size_t N;   // K/V sequence length.
+    const int H;           // Number of heads.
+    const int M;           // Query sequence length.
+    const int N;           // K/V sequence length.
 };
 
 /**
@@ -100,16 +109,15 @@ struct FlashForwardKernelParams {
  * blockIdx.x and blockIdx.y. Pass blockIdx.z for a Q/O tile and the K/V-loop
  * index for a K/V tile.
  */
-__device__ __forceinline__ std::size_t get_tile_offset(const std::size_t num_heads,
-                                                       const std::size_t total_rows,
-                                                       const std::size_t total_cols,
-                                                       const std::size_t tile_rows,
-                                                       const std::size_t tile_idx) {
-    const std::size_t batch_idx = static_cast<std::size_t>(blockIdx.x);
-    const std::size_t head_idx = static_cast<std::size_t>(blockIdx.y);
-    const std::size_t batch_head_offset =
-        ((batch_idx * num_heads) + head_idx) * total_rows * total_cols;
-    return batch_head_offset + (tile_idx * tile_rows * total_cols);
+__device__ __forceinline__ std::size_t get_tile_offset(const int num_heads,
+                                                       const int total_rows,
+                                                       const int tile_rows,
+                                                       const int tile_idx) {
+    const int batch_idx = static_cast<int>(blockIdx.x);
+    const int head_idx = static_cast<int>(blockIdx.y);
+    const int row_offset =
+        (((batch_idx * num_heads) + head_idx) * total_rows) + (tile_idx * tile_rows);
+    return static_cast<std::size_t>(row_offset) * HEAD_DIM;
 }
 
 /**
@@ -118,23 +126,23 @@ __device__ __forceinline__ std::size_t get_tile_offset(const std::size_t num_hea
  */
 __device__ void load_shared_tile_vectorized(float *const smem_ptr,
                                             const float *const gmem_ptr,
-                                            const std::size_t H,
-                                            const std::size_t total_rows,
-                                            const std::size_t tile_rows,
-                                            const std::size_t tile_i,
-                                            const std::size_t s_row_stride) {
+                                            const int H,
+                                            const int total_rows,
+                                            const int tile_rows,
+                                            const int tile_i,
+                                            const int s_row_stride) {
     static_assert(HEAD_DIM == 64, "V4 vectorized tile loads assume D=64");
-    constexpr std::size_t VECTOR_WIDTH = 4;
-    constexpr std::size_t VECTORS_PER_ROW = HEAD_DIM / VECTOR_WIDTH;
-    const std::size_t vector_tile_size = tile_rows * VECTORS_PER_ROW;
-    const std::size_t g_tile_start = tile_i * tile_rows;
-    const std::size_t g_tile_offset = get_tile_offset(H, total_rows, HEAD_DIM, tile_rows, tile_i);
+    constexpr int VECTOR_WIDTH = 4;
+    constexpr int VECTORS_PER_ROW = HEAD_DIM / VECTOR_WIDTH;
+    const int vector_tile_size = tile_rows * VECTORS_PER_ROW;
+    const int g_tile_start = tile_i * tile_rows;
+    const std::size_t g_tile_offset = get_tile_offset(H, total_rows, tile_rows, tile_i);
     const auto *const g_tile_vectors = reinterpret_cast<const float4 *>(gmem_ptr + g_tile_offset);
 
-    for (std::size_t vector_i = static_cast<std::size_t>(threadIdx.x); vector_i < vector_tile_size;
+    for (int vector_i = static_cast<int>(threadIdx.x); vector_i < vector_tile_size;
          vector_i += blockDim.x) {
-        const std::size_t s_row = vector_i / VECTORS_PER_ROW;
-        const std::size_t vector_col = vector_i % VECTORS_PER_ROW;
+        const int s_row = vector_i / VECTORS_PER_ROW;
+        const int vector_col = vector_i % VECTORS_PER_ROW;
         const float4 values = g_tile_start + s_row < total_rows
                                   ? g_tile_vectors[vector_i]
                                   : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
@@ -149,7 +157,7 @@ __device__ void load_shared_tile_vectorized(float *const smem_ptr,
 /** Loads Q_i [B_r, D]. */
 __device__ float *load_Q_i(const FlashForwardKernelParams &p,
                            float *const smem_ptr,
-                           const std::size_t tile_i) {
+                           const int tile_i) {
     float *const sQ_i = smem_ptr + TileParams::sQ_offset;
     load_shared_tile_vectorized(sQ_i, p.gQ, p.H, p.M, B_r, tile_i, HEAD_DIM);
     return sQ_i;
@@ -163,7 +171,7 @@ __device__ float *load_Q_i(const FlashForwardKernelParams &p,
  */
 __device__ float *load_K_j(const FlashForwardKernelParams &p,
                            float *const smem_ptr,
-                           const std::size_t tile_j) {
+                           const int tile_j) {
     float *const sK_j = smem_ptr + TileParams::sKV_shared_offset;
     load_shared_tile_vectorized(sK_j, p.gK, p.H, p.N, B_c, tile_j, K_SHARED_STRIDE);
     return sK_j;
@@ -172,7 +180,7 @@ __device__ float *load_K_j(const FlashForwardKernelParams &p,
 /** Loads V_j [B_c, D] after K's aliased shared storage is no longer needed. */
 __device__ float *load_V_j(const FlashForwardKernelParams &p,
                            float *const smem_ptr,
-                           const std::size_t tile_j) {
+                           const int tile_j) {
     float *const sV_j = smem_ptr + TileParams::sKV_shared_offset;
     load_shared_tile_vectorized(sV_j, p.gV, p.H, p.N, B_c, tile_j, HEAD_DIM);
     return sV_j;
@@ -209,18 +217,18 @@ template <ReductionOp Op> __device__ __forceinline__ float warp_allreduce(float 
  */
 __device__ __forceinline__ void score_ij(const float *const sQ_i,
                                          const float *const sK_j,
-                                         const std::size_t row_start,
-                                         const std::size_t lane,
+                                         const int row_start,
+                                         const int lane,
                                          const bool key_valid,
                                          float (&wS_ij)[ROWS_PER_WARP]) {
     if (!key_valid) {
         return;
     }
 
-    for (std::size_t k = 0; k < HEAD_DIM; ++k) {
+    for (int k = 0; k < HEAD_DIM; ++k) {
         const float key = sK_j[(lane * K_SHARED_STRIDE) + k];
-        for (std::size_t owned_row = 0; owned_row < ROWS_PER_WARP; ++owned_row) {
-            const std::size_t row = row_start + owned_row;
+        for (int owned_row = 0; owned_row < ROWS_PER_WARP; ++owned_row) {
+            const int row = row_start + owned_row;
             wS_ij[owned_row] += sQ_i[(row * HEAD_DIM) + k] * key;
         }
     }
@@ -230,18 +238,18 @@ __device__ __forceinline__ void score_ij(const float *const sQ_i,
  * Updates this warp's online-softmax state and writes its P rows to shared memory.
  */
 __device__ __forceinline__ void online_softmax_ij(float *const sP_ij_unnormalized,
-                                                  const std::size_t M,
-                                                  const std::size_t query_start,
-                                                  const std::size_t row_start,
-                                                  const std::size_t lane,
+                                                  const int M,
+                                                  const int query_start,
+                                                  const int row_start,
+                                                  const int lane,
                                                   const bool key_valid,
                                                   float (&wS_ij)[ROWS_PER_WARP],
                                                   float (&wM_i_replicated)[ROWS_PER_WARP],
                                                   float (&wL_i_replicated)[ROWS_PER_WARP],
                                                   float (&wO_i_left_unnormalized)[ROWS_PER_WARP],
                                                   float (&wO_i_right_unnormalized)[ROWS_PER_WARP]) {
-    for (std::size_t owned_row = 0; owned_row < ROWS_PER_WARP; ++owned_row) {
-        const std::size_t row = row_start + owned_row;
+    for (int owned_row = 0; owned_row < ROWS_PER_WARP; ++owned_row) {
+        const int row = row_start + owned_row;
         const bool query_valid = query_start + row < M;
         wS_ij[owned_row] = query_valid && key_valid ? wS_ij[owned_row] * SOFTMAX_SCALE
                                                     : -std::numeric_limits<float>::infinity();
@@ -265,15 +273,15 @@ __device__ __forceinline__ void online_softmax_ij(float *const sP_ij_unnormalize
  */
 __device__ __forceinline__ void accumulate_O_i(const float *const sP_ij_unnormalized,
                                                const float *const sV_j,
-                                               const std::size_t row_start,
-                                               const std::size_t lane,
+                                               const int row_start,
+                                               const int lane,
                                                float (&wO_i_left_unnormalized)[ROWS_PER_WARP],
                                                float (&wO_i_right_unnormalized)[ROWS_PER_WARP]) {
-    for (std::size_t key_row = 0; key_row < B_c; ++key_row) {
+    for (int key_row = 0; key_row < B_c; ++key_row) {
         const float value_left = sV_j[(key_row * HEAD_DIM) + lane];
         const float value_right = sV_j[(key_row * HEAD_DIM) + lane + WARP_SIZE];
-        for (std::size_t owned_row = 0; owned_row < ROWS_PER_WARP; ++owned_row) {
-            const std::size_t row = row_start + owned_row;
+        for (int owned_row = 0; owned_row < ROWS_PER_WARP; ++owned_row) {
+            const int row = row_start + owned_row;
             const float p_value = sP_ij_unnormalized[(row * B_c) + key_row];
             wO_i_left_unnormalized[owned_row] += p_value * value_left;
             wO_i_right_unnormalized[owned_row] += p_value * value_right;
@@ -285,25 +293,27 @@ __device__ __forceinline__ void accumulate_O_i(const float *const sP_ij_unnormal
  * Normalizes and stores this lane's output columns.
  */
 __device__ __forceinline__ void normalize_and_save_O_i(const FlashForwardKernelParams &p,
-                                                       const std::size_t query_start,
-                                                       const std::size_t row_start,
-                                                       const std::size_t lane,
+                                                       const int query_start,
+                                                       const int row_start,
+                                                       const int lane,
                                                        const float (&wL_i_replicated)
                                                            [ROWS_PER_WARP],
                                                        const float (&wO_i_left_unnormalized)
                                                            [ROWS_PER_WARP],
                                                        const float (&wO_i_right_unnormalized)
                                                            [ROWS_PER_WARP]) {
-    const std::size_t batch_head =
-        (static_cast<std::size_t>(blockIdx.x) * p.H) + static_cast<std::size_t>(blockIdx.y);
-    const std::size_t output_head_offset = batch_head * p.M * HEAD_DIM;
-    for (std::size_t owned_row = 0; owned_row < ROWS_PER_WARP; ++owned_row) {
-        const std::size_t global_row = query_start + row_start + owned_row;
+    const int batch_head = (static_cast<int>(blockIdx.x) * p.H) + static_cast<int>(blockIdx.y);
+    const std::size_t output_head_offset =
+        static_cast<std::size_t>(batch_head) * static_cast<std::size_t>(p.M) * HEAD_DIM;
+    const std::size_t lane_offset = static_cast<std::size_t>(lane);
+    for (int owned_row = 0; owned_row < ROWS_PER_WARP; ++owned_row) {
+        const int global_row = query_start + row_start + owned_row;
         if (global_row < p.M) {
-            const std::size_t output_row_offset = output_head_offset + (global_row * HEAD_DIM);
-            p.gO[output_row_offset + lane] =
+            const std::size_t output_row_offset =
+                output_head_offset + (static_cast<std::size_t>(global_row) * HEAD_DIM);
+            p.gO[output_row_offset + lane_offset] =
                 wO_i_left_unnormalized[owned_row] / wL_i_replicated[owned_row];
-            p.gO[output_row_offset + lane + WARP_SIZE] =
+            p.gO[output_row_offset + lane_offset + WARP_SIZE] =
                 wO_i_right_unnormalized[owned_row] / wL_i_replicated[owned_row];
         }
     }
@@ -322,14 +332,14 @@ __global__ void forward_d64(FlashForwardKernelParams p) {
 
     float *const sP_ij_unnormalized = smem + TileParams::sP_offset;
 
-    const std::size_t warp = static_cast<std::size_t>(threadIdx.x) / WARP_SIZE;
-    const std::size_t lane = static_cast<std::size_t>(threadIdx.x) % WARP_SIZE;
+    const int warp = static_cast<int>(threadIdx.x) / WARP_SIZE;
+    const int lane = static_cast<int>(threadIdx.x) % WARP_SIZE;
     // Warps split Q/output rows. Their lanes split the K/V work, so every lane
     // loops over the rows owned by its warp instead of owning one complete row.
-    const std::size_t row_start = warp * ROWS_PER_WARP;
-    const std::size_t query_tile = static_cast<std::size_t>(blockIdx.z);
-    const std::size_t query_start = query_tile * B_r;
-    const std::size_t key_tiles = detail::ceil_div<std::size_t>(p.N, B_c);
+    const int row_start = warp * ROWS_PER_WARP;
+    const int query_tile = static_cast<int>(blockIdx.z);
+    const int query_start = query_tile * B_r;
+    const int key_tiles = detail::ceil_div<int>(p.N, B_c);
 
     // Replicated across lanes after warp reductions: each lane needs the same
     // softmax state for ROWS_PER_WARP rows.
@@ -342,14 +352,14 @@ __global__ void forward_d64(FlashForwardKernelParams p) {
     // in 32-63. Collectively across the warp, it contains all columns 32-63.
     float wO_i_right_unnormalized[ROWS_PER_WARP] = {};
 
-    for (std::size_t row = 0; row < ROWS_PER_WARP; ++row) {
+    for (int row = 0; row < ROWS_PER_WARP; ++row) {
         wM_i_replicated[row] = -std::numeric_limits<float>::infinity();
         wL_i_replicated[row] = 0.0F;
     }
 
     float *const sQ_i = load_Q_i(p, smem, query_tile);
 
-    for (std::size_t key_tile = 0; key_tile < key_tiles; ++key_tile) {
+    for (int key_tile = 0; key_tile < key_tiles; ++key_tile) {
         float *const sK_j = load_K_j(p, smem, key_tile);
         __syncthreads();
 
@@ -380,7 +390,8 @@ __global__ void forward_d64(FlashForwardKernelParams p) {
 } // namespace
 
 /**
- * Allocates the running softmax state and launches the tiled attention kernel.
+ * Configures and launches the tiled attention kernel. The kernel keeps its
+ * running softmax state in registers.
  */
 void flash_forward_v4_cuda_launch(const float *gQ,
                                   const float *gK,
@@ -398,12 +409,12 @@ void flash_forward_v4_cuda_launch(const float *gQ,
         gK,
         gV,
         gO,
-        static_cast<std::size_t>(H),
-        static_cast<std::size_t>(M),
-        static_cast<std::size_t>(N),
+        H,
+        M,
+        N,
     };
 
-    const std::size_t query_tiles = detail::ceil_div<std::size_t>(static_cast<std::size_t>(M), B_r);
+    const int query_tiles = detail::ceil_div<int>(M, B_r);
     // One block per (batch, head, Q tile).
     dim3 grid{static_cast<unsigned int>(B), static_cast<unsigned int>(H),
               static_cast<unsigned int>(query_tiles)};
