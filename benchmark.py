@@ -61,6 +61,11 @@ def time_cuda_call(call, warmup=WARMUP, repetitions=REPETITIONS):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "implementation",
+        choices=("all", *IMPLEMENTATIONS),
+        help="implementation to benchmark",
+    )
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--num-heads", type=int, default=NUM_HEADS)
     parser.add_argument("--head-dim", type=int, default=HEAD_DIM)
@@ -74,6 +79,11 @@ def main():
 
     print("| Version | Sequence length | Latency (µs) |")
     print("| --- | ---: | ---: |")
+    implementations = (
+        IMPLEMENTATIONS.items()
+        if args.implementation == "all"
+        else ((args.implementation, IMPLEMENTATIONS[args.implementation]),)
+    )
     for seq_len in args.seq_lens:
         q, k, v = make_inputs(
             seq_len,
@@ -81,7 +91,7 @@ def main():
             num_heads=args.num_heads,
             head_dim=args.head_dim,
         )
-        for version, forward in IMPLEMENTATIONS.items():
+        for version, forward in implementations:
             latency = time_cuda_call(
                 lambda: forward(q, k, v),
                 warmup=args.warmup,

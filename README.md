@@ -1,100 +1,205 @@
-# FlashAttention
+# FlashAttention-2
 
-Pedagogical project implementing multi-head attention forward passes with handwritten CUDA kernels.
-Surrounding infrastructure (profiling script, PyTorch binding etc) is not hand-written.
+Pedagogical project implementing multi-head attention forward passes with CUDA kernels.
 
 ## Usage
 
 ```python
 import torch
-import flash_attention_v1
 
-q = torch.randn(2, 3, 32, 16, device="cuda")
+import flash_attention_v4
+
+q = torch.randn(2, 3, 32, 64, device="cuda")
 k = torch.randn_like(q)
 v = torch.randn_like(q)
 
-out = flash_attention_v1.forward(q, k, v)
+out = flash_attention_v4.forward(q, k, v)
 ```
 
 ## Results
 
 Primary shape: `B=4, H=12, M=N=2048, D=64, dtype=float32` (all implementations are non-causal).
+The table below was measured with 5 warmups and 10 repetitions. The benchmark
+command defaults to 25 warmups and 100 repetitions for more stable results.
 
-### Implementations and latency
+### Roofline
 
-| Version | Latency (µs) | Δ vs. baseline | Design |
-| --- | ---: | ---: | --- |
-| Baseline | 9295.93 | — | Explicit PyTorch attention; correctness and latency reference |
-| V0 | 36074.19 | +288.1% | Unfused kernels that materialize attention; naive CUDA starting point |
-| V1 | 182577.85 | +1864.1% | Fused tiled online softmax; first FlashAttention-style implementation |
-| V2 | 103111.38 | +1009.2% | FA2-style query/warp partitioning with shared state; warp-local optimization starting point |
+![Nsight Compute roofline comparison of V1 through V4](roofline-v1-to-v4.png)
+
+From left to right, each circle represents v1, v2, v3, and v4 (top right).
+
+The combined Nsight Compute roofline shows the optimization progression from V1
+through V4. A fresh standalone profile of the current V4 kernel places it on
+the compute-bound side of the FP32 ridge and reaches 29% of peak FP32
+throughput. The image predates V4's selective 32-bit indexing optimization, but
+the resulting upward movement is small on its logarithmic scale.
+
+### Implementations
+
+| Version | Title | Latency (µs) | Δ vs. baseline | Description |
+| --- | --- | ---: | ---: | --- |
+| Baseline | Naive PyTorch | 11940.15 | — | Explicit PyTorch attention used as the correctness and latency reference |
+| SDPA | PyTorch SDPA | 5507.07 | −53.9% | Optimized PyTorch reference with automatic CUDA backend selection |
+| V0 | Naive CUDA | 41232.39 | +245.3% | Unfused CUDA kernels that materialize the attention matrix |
+| V1 | FlashAttention-1 | 241906.59 | +1926.0% | Fused tiled online softmax with one block per batch and head |
+| V2 | Simplified FlashAttention-2 | 128997.28 | +980.4% | FA2-style query-tile parallelism, but most state still lives in shared memory |
+| V3 | Warp-local FlashAttention-2 | 7790.91 | −34.8% | V3 with warp-owned softmax/output state, register-blocked QK and PV, and reused K/V shared storage |
+| V4 | Optimized V3 | 3810.30 | −68.1% | V3 with vectorized copies, forced inlining, padded shared K rows, and selective 32-bit indexing |
+
+At `M=N=2048`, V4 was 1,696.77 µs, or 30.8%, faster than SDPA.
 
 The CUDA implementations accept contiguous CUDA `float32` tensors. V0 requires self-attention
-with `M = N`; V1 and V2 accept Q `[B, H, M, D]` and K/V `[B, H, N, D]`.
+with `M = N`. V1–V4 accept Q `[B, H, M, D]` and K/V `[B, H, N, D]`.
+V3 and V4 hardcode their CUDA kernels to `D=64` for simplicity and redirect
+other head dimensions to V2.
 
-### V1 profiling
+## Notes
 
-The fused v1 kernel was profiled on an original RTX 4080:
+The fused kernels were profiled on an original RTX 4080 using the primary
+benchmark shape. Baseline has no project CUDA kernel. V0 launches several
+kernels that use 8–37 registers per thread, so it does not have one register
+count or occupancy result. SDPA is an external PyTorch reference, so it is not
+included in the project-kernel profiling tables.
 
-| Metric | Measured | RTX 4080 reference |
-| --- | ---: | ---: |
-| FP32 throughput | 0.336 TFLOP/s | 48.7 TFLOP/s peak |
-| DRAM bandwidth | 0.416 GB/s | 716.8 GB/s peak |
-| Arithmetic intensity | 809.701 FLOP/byte | 67.9 FLOP/byte ridge point |
+### V1: FlashAttention-1
+
+| Metric | Value | Interpretation |
+| --- | ---: | --- |
+| Profiled duration | 190.54 ms | — |
+| FP32 throughput | 0.336 TFLOP/s | About 0.7% of the FP32 roofline peak |
+| Arithmetic intensity | 43.38 FLOP/byte | On the memory-bound side of the FP32 ridge |
+| DRAM bandwidth | 7.76 GB/s | Achieved roofline traffic |
 | Occupancy | 8.33% achieved | 16.67% theoretical |
-| Grid | 48 blocks | 76 SMs |
-| Shared memory | 38.40 KB/block | Limits residency to 2 blocks/SM |
+| Theoretical blocks/SM | 2 | Limited by shared memory |
+| Registers | 40/thread | — |
+| Shared memory | 38.40 KB/block | 37.38 KB dynamic |
 
-### V2 profiling
+V1 follows the basic FA1 idea. It avoids the full attention matrix and extra
+transposes, and it uses warp reductions for softmax. Its biggest problem is the
+grid. It launches one block per `(batch, head)`, which gives us only 48 blocks
+for this benchmark. The RTX 4080 has 76 SMs, so some of them never get any work.
 
-The fused v2 kernel was profiled on the same GPU:
+Shared memory also limits how many blocks can run on each SM. The kernel could
+reach eight active warps per SM in theory, but I measured only four. The next
+step is to split the work into independent query tiles like FA2 instead of trying
+to tune a launch with only 48 blocks.
 
-| Metric | Measured | RTX 4080 reference |
-| --- | ---: | ---: |
-| FP32 throughput | 0.562 TFLOP/s | 48.7 TFLOP/s peak |
-| DRAM bandwidth | 9.10 GB/s | 716.8 GB/s peak |
-| Arithmetic intensity | 61.70 FLOP/byte | 67.9 FLOP/byte ridge point |
-| Occupancy | 8.33% achieved | 8.33% theoretical |
-| Grid | 1,536 blocks | 76 SMs |
-| Shared memory | 58.37 KB/block | Limits residency to 1 block/SM |
+### V2: Simplified FlashAttention-2
 
-The hardware references come from NVIDIA's
-[Ada GPU architecture whitepaper](https://images.nvidia.com/aem-dam/Solutions/Data-Center/l4/nvidia-ada-gpu-architecture-whitepaper-V2.02.pdf).
+| Metric | Value | Interpretation |
+| --- | ---: | --- |
+| Profiled duration | 107.44 ms | — |
+| FP32 throughput | 0.562 TFLOP/s | About 1.2% of the FP32 roofline peak |
+| Arithmetic intensity | 70.30 FLOP/byte | Approximately at the FP32 ridge |
+| DRAM bandwidth | 7.99 GB/s | Achieved roofline traffic |
+| Occupancy | 8.35% achieved | 8.33% theoretical |
+| Theoretical blocks/SM | 1 | Limited by shared memory |
+| Registers | 40/thread | — |
+| Shared memory | 59.39 KB/block | 58.37 KB dynamic |
 
-### Notes
+V2 adds FA2-style query tiles and gives each warp complete score rows. That
+raises the grid from 48 blocks to 1,536, so there is plenty of work for every SM.
+The catch is that it still keeps `m`, `l`, `O`, and the temporary softmax state
+in shared memory along with the Q/K/V and S/P tiles.
 
-#### Baseline
+That adds up to 58.37 KB of dynamic shared memory per block, or 59.39 KB after
+including the driver's 1.02 KB reservation. Only one 128-thread block, or four
+warps, can run on an SM at a time. Theoretical occupancy is 8.33% (4 active
+warps / 48 maximum warps per SM), closely matching the measured 8.35%. The
+clear next step is to move the running softmax state and output into registers
+and reuse the shared buffers.
 
-The explicit PyTorch implementation is the correctness and latency reference.
+### V3: Warp-local FlashAttention-2
 
-#### V0
+| Metric | Value | Interpretation |
+| --- | ---: | --- |
+| Profiled duration | 6.53 ms | — |
+| FP32 throughput | 8.89 TFLOP/s | About 18% of the FP32 roofline peak |
+| Arithmetic intensity | 362.30 FLOP/byte | On the compute-bound side of the FP32 ridge |
+| DRAM bandwidth | 24.54 GB/s | Achieved roofline traffic |
+| Occupancy | 48.44% achieved | 50.00% theoretical |
+| Theoretical blocks/SM | 3 | Limited jointly by registers and shared memory |
+| Registers | 80/thread | — |
+| Shared memory | 33.79 KB/block | 32.77 KB dynamic |
 
-V0 is slower than the PyTorch baseline despite using tiled CUDA kernels.
+V3 uses `D=64` because it makes the warp-local state easy to express with
+fixed-size per-thread arrays that the compiler can keep in registers. Other head
+dimensions fall back to V2. Each block has 8 warps, and each warp owns 8
+query and output rows. Warp shuffles copy the running maximum and denominator
+across the lanes. Each lane keeps its own output columns in registers.
 
-#### V1
+Unlike V2, V3 does not need shared memory for `m_i`, `l_i`, or the unnormalized
+`O_i`. Each warp keeps that state in per-thread registers. Only Q and the
+unnormalized P tile stay in shared memory, while K and V take turns using the
+same shared tile. This cuts shared memory from 58.37 KB in V2 to 32.77 KB. With
+`B_r=64`, `B_c=32`, and `D=64`, the calculation is:
 
-V1 follows the FA1 and avoids the full attention matrix, avoids unnecessary transposes, and performs warp reductions but one of the main issues is it's grid setup. It uses block per `(batch, head)` which produces only 48 blocks for the benchmarked shape, so some of the RTX 4080's 76 SMs receive no work. In fact ideally, we have more than 76 blocks running at a time. As for occupancy, shared memory caps residency at eight theoretical
-warps per SM while the kernel achieves four.
+```text
+sQ:    64 × 64 = 4,096 floats
+sK/V:  32 × 64 = 2,048 floats
+sP:    64 × 32 = 2,048 floats
+total: 8,192 floats × 4 bytes = 32,768 bytes
+```
 
-The next architectural step is to parallelize independent query tiles, following the
-FlashAttention-2 work partition rather than tuning the current 48-block launch.
+With 80 registers per thread, an SM can run three blocks. That gives us 24
+active warps out of 48, so theoretical occupancy is 50% (measured 48.44%).
 
-#### V2
+The block size is important because the GPU places a whole block on an SM. A
+256-thread block gives us the 8 warps needed for this row mapping while
+still letting three blocks fit.
 
-V2 adds FA2-style query-tile parallelism and assigns complete score rows to
-warps, increasing the benchmark grid from 48 to 1,536 blocks. However, this
-simplified implementation does not completely follow FA2's warp-local storage
-strategy. It keeps `m`, `l`, `O`, and temporary softmax state in shared memory
-alongside the Q/K/V and S/P tiles.
+### V4: Optimized V3
 
-The resulting 58.37 KB shared-memory allocation permits only one 128-thread
-block, or four active warps, per SM. This limits both theoretical and achieved
-occupancy to 8.33%. A more complete FA2 implementation would keep the running
-softmax state and output accumulators in warp/thread registers, reuse shared
-buffers more aggressively, and reserve shared memory primarily for staging
-matrix tiles.
+| Metric | Value | Interpretation |
+| --- | ---: | --- |
+| Profiled duration | 4.12 ms | — |
+| FP32 throughput | 14.10 TFLOP/s | About 29% of the FP32 roofline peak |
+| Arithmetic intensity | 376.36 FLOP/byte | On the compute-bound side of the FP32 ridge |
+| DRAM bandwidth | 37.47 GB/s | Achieved roofline traffic |
+| Occupancy | 48.39% achieved | 50.00% theoretical |
+| Theoretical blocks/SM | 3 | Limited jointly by registers and shared memory |
+| Registers | 80/thread | — |
+| Shared memory | 33.92 KB/block | 32.90 KB dynamic |
 
-## Setup
+V4 keeps the same algorithm and warp mapping as V3. It just adds a few
+lower-level CUDA optimizations. Together, they cut latency from 7,790.91 µs to
+3,810.30 µs, which saves 3,980.61 µs or 51.1%.
+
+The profiled duration was collected under Nsight Compute and is distinct from
+the standalone timing benchmark.
+
+Trying to force every loop to unroll made things worse. Register use went from
+80 to 91 per thread, so only two blocks could fit on each SM instead of three.
+
+Using aligned vector copies for Q, K, and V cut latency from 7,778.20 µs to
+7,243.62 µs. That saved 534.58 µs or 6.9%.
+
+I also pad each shared K row from 64 to 65 floats. This stops the QK reads from
+hitting the same shared-memory bank and cut latency from 7,243.62 µs to
+5,393.84 µs. That saved another 1,849.78 µs or 25.5%. The padding changes the
+shared-memory calculation to:
+
+```text
+sQ:    64 × 64 = 4,096 floats
+sK/V:  32 × 65 = 2,080 floats
+sP:    64 × 32 = 2,048 floats
+total: 8,224 floats × 4 bytes = 32,896 bytes
+```
+
+Using `int` selectively for bounded tile, row, warp, lane, and loop indices
+provided another substantial gain while retaining `std::size_t` for global
+memory offsets. The benchmark measured 3,810.30 µs with
+selective 32-bit indexing, saving another 1,561.19 µs or 29.1%. The 32-bit
+indices avoid unnecessary 64-bit integer arithmetic in the kernel's hot loops,
+while the explicitly widened global offsets can still address the complete
+tensors.
+
+The next things to try are tensor-core MMA for QK and PV, and some careful
+register-tile tuning that still lets more than one block fit on an SM.
+
+## Commands
+
+### Setup
 
 Requires Python 3.12, CUDA-enabled PyTorch, a compatible CUDA toolkit with `nvcc`, and a
 CUDA-compatible C++20 compiler.
@@ -106,13 +211,20 @@ python -m pip install -r requirements.txt
 python setup.py build_ext --inplace
 ```
 
+After adding, renaming, or moving a CUDA extension, force an in-place rebuild so
+stale incremental build artifacts are not reused:
+
+```bash
+python setup.py build_ext --inplace --force
+```
+
 To target a different GPU architecture:
 
 ```bash
 TORCH_CUDA_ARCH_LIST=<value> python setup.py build_ext --inplace
 ```
 
-## Tests
+### Tests
 
 ```bash
 python -m pytest -q
@@ -124,19 +236,30 @@ For CUDA memory checks:
 compute-sanitizer --target-processes all python -m pytest -q
 ```
 
-## Benchmarks
-
-```bash
-python benchmark.py
-```
+### Benchmarks
 
 The fixed suite measures `M=N=512, 1024, 2048` at `B=4, H=12, D=64`, using 25 warmups and 100
 timed calls.
 
+Benchmark every registered implementation:
+
+```bash
+python benchmark.py all
+```
+
+Or benchmark one implementation:
+
+```bash
+python benchmark.py v4
+```
+
+The required implementation argument accepts `all`, `baseline`, `sdpa`, and
+`v0` through `v4`.
+
 The shape and timing counts can be overridden for larger, shorter benchmark runs:
 
 ```bash
-python benchmark.py \
+python benchmark.py v4 \
   --batch-size 1 \
   --num-heads 32 \
   --head-dim 64 \
@@ -145,16 +268,17 @@ python benchmark.py \
   --repetitions 10
 ```
 
-## Profiling
+### Profiling
 
-Profiling is restricted to fused implementations. Baseline and v0 launch multiple kernels, so a
-single roofline or occupancy value would be ambiguous.
+Profiling commands cover the project's fused implementations. Baseline and V0
+launch multiple kernels, so a single roofline or occupancy value would be
+ambiguous. SDPA is handled inside PyTorch and is not profiled here.
 
 `profile.sh` captures the roofline, occupancy, and launch statistics in one report. Profile one
 fused implementation:
 
 ```bash
-./profile.sh v1
+./profile.sh v4
 ```
 
 Or profile every registered fused implementation:
@@ -163,23 +287,33 @@ Or profile every registered fused implementation:
 ./profile.sh all
 ```
 
-`all` prints a skip message for baseline and v0 because they are unfused. Passing either one
-directly is an error. If non-admin GPU performance counters are disabled, run the script with
-`sudo`; it uses the repository's virtual environment by absolute path.
+`all` skips baseline, SDPA, and V0. Passing one of them directly is an error. If
+non-admin GPU performance counters are disabled, run the script with `sudo`.
+It uses the repository's virtual environment by absolute path.
 
 Reports are saved as `/tmp/flash_<implementation>_s2048_profile.ncu-rep`.
 
 Open the report:
 
 ```bash
-ncu-ui /tmp/flash_v1_s2048_profile.ncu-rep
+ncu-ui /tmp/flash_v4_s2048_profile.ncu-rep
+```
+
+Open all four reports:
+
+```bash
+ncu-ui \
+  /tmp/flash_v1_s2048_profile.ncu-rep \
+  /tmp/flash_v2_s2048_profile.ncu-rep \
+  /tmp/flash_v3_s2048_profile.ncu-rep \
+  /tmp/flash_v4_s2048_profile.ncu-rep
 ```
 
 Print occupancy and launch statistics:
 
 ```bash
 /usr/local/cuda/bin/ncu \
-  --import /tmp/flash_v1_s2048_profile.ncu-rep \
+  --import /tmp/flash_v4_s2048_profile.ncu-rep \
   --page details \
   --section Occupancy \
   --section LaunchStats
@@ -189,8 +323,14 @@ Print the roofline overview:
 
 ```bash
 /usr/local/cuda/bin/ncu \
-  --import /tmp/flash_v1_s2048_profile.ncu-rep \
+  --import /tmp/flash_v4_s2048_profile.ncu-rep \
   --page details \
   --section SpeedOfLight_RooflineChart \
   --print-details all
 ```
+
+## Sources
+
+1. [FlashAttention](https://arxiv.org/abs/2205.14135)
+2. [FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning](https://arxiv.org/abs/2307.08691)
+3. [From Online Softmax to FlashAttention](https://courses.cs.washington.edu/courses/cse599m/23sp/notes/flashattn.pdf)
