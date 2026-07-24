@@ -70,7 +70,7 @@ if [[ "$requested" == "all" ]]; then
     if contains "$implementation" "${fused_implementations[@]}"; then
       profile_implementation "$implementation"
     else
-      echo "Skipping $implementation: profiling is restricted to fused implementations."
+      echo "Skipping $implementation: profiling is restricted to project fused implementations."
     fi
   done
   exit 0
@@ -83,7 +83,7 @@ if ! contains "$requested" "${implementations[@]}"; then
 fi
 
 if ! contains "$requested" "${fused_implementations[@]}"; then
-  echo "error: $requested is unfused; profiling is restricted to fused implementations" >&2
+  echo "error: $requested is not a project fused implementation" >&2
   exit 2
 fi
 

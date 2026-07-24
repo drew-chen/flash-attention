@@ -8,6 +8,7 @@ import flash_attention_v0
 import flash_attention_v1
 import flash_attention_v2
 import flash_attention_v3
+import flash_attention_v4
 from src.baseline import forward as baseline_forward
 
 BATCH_SIZE = 4
@@ -17,12 +18,19 @@ SEQ_LENS = (512, 1024, 2048)
 WARMUP = 25
 REPETITIONS = 100
 
+
+def sdpa_forward(q, k, v):
+    return torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+
 IMPLEMENTATIONS = {
     "baseline": baseline_forward,
+    "sdpa": sdpa_forward,
     "v0": flash_attention_v0.forward_unchecked,
     "v1": flash_attention_v1.forward_unchecked,
     "v2": flash_attention_v2.forward_unchecked,
     "v3": flash_attention_v3.forward_unchecked,
+    "v4": flash_attention_v4.forward_unchecked,
 }
 
 

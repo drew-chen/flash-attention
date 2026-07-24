@@ -7,7 +7,7 @@ import torch
 from benchmark import IMPLEMENTATIONS, make_inputs
 
 SEQ_LEN = 2048
-FUSED_IMPLEMENTATIONS = ("v1", "v2", "v3")
+FUSED_IMPLEMENTATIONS = ("v1", "v2", "v3", "v4")
 
 
 def main():
