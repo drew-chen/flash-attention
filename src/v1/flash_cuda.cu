@@ -321,6 +321,7 @@ and finally _i means a subscript of i.
 */
 
 namespace flash_attention {
+namespace {
 
 constexpr int THREAD_BLOCK_SZ = 128;
 // TODO: Reuse SRAM buffers more tightly, then calculate B_R and B_C dynamically.
@@ -898,6 +899,8 @@ __global__ void forward(FlashForwardKernelParams p) {
         }
     }
 }
+
+} // namespace
 
 /**
  * Allocates the running softmax state and launches the tiled attention kernel.
