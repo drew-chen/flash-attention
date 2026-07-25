@@ -63,63 +63,21 @@ def build_extension_modules():
 
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", DEFAULT_CUDA_ARCH_LIST)
 
-    return [
-        CUDAExtension(
-            name="flash_attention_v0",
+    def make_flash_extension(version):
+        version_dir = ROOT / f"src/v{version}"
+        return CUDAExtension(
+            name=f"flash_attention_v{version}",
             sources=[
-                str(ROOT / "src/v0/flash.cpp"),
-                str(ROOT / "src/v0/flash_cuda.cu"),
+                str(version_dir / "flash.cpp"),
+                str(version_dir / "flash_kernel.cu"),
             ],
             extra_compile_args={
                 "cxx": HOST_WARNING_FLAGS,
                 "nvcc": NVCC_WARNING_FLAGS,
             },
-        ),
-        CUDAExtension(
-            name="flash_attention_v1",
-            sources=[
-                str(ROOT / "src/v1/flash.cpp"),
-                str(ROOT / "src/v1/flash_cuda.cu"),
-            ],
-            extra_compile_args={
-                "cxx": HOST_WARNING_FLAGS,
-                "nvcc": NVCC_WARNING_FLAGS,
-            },
-        ),
-        CUDAExtension(
-            name="flash_attention_v2",
-            sources=[
-                str(ROOT / "src/v2/flash.cpp"),
-                str(ROOT / "src/v2/flash_cuda.cu"),
-            ],
-            extra_compile_args={
-                "cxx": HOST_WARNING_FLAGS,
-                "nvcc": NVCC_WARNING_FLAGS,
-            },
-        ),
-        CUDAExtension(
-            name="flash_attention_v3",
-            sources=[
-                str(ROOT / "src/v3/flash.cpp"),
-                str(ROOT / "src/v3/flash_cuda.cu"),
-            ],
-            extra_compile_args={
-                "cxx": HOST_WARNING_FLAGS,
-                "nvcc": NVCC_WARNING_FLAGS,
-            },
-        ),
-        CUDAExtension(
-            name="flash_attention_v4",
-            sources=[
-                str(ROOT / "src/v4/flash.cpp"),
-                str(ROOT / "src/v4/flash_cuda.cu"),
-            ],
-            extra_compile_args={
-                "cxx": HOST_WARNING_FLAGS,
-                "nvcc": NVCC_WARNING_FLAGS,
-            },
-        ),
-    ]
+        )
+
+    return [make_flash_extension(version) for version in range(5)]
 
 
 _, BuildExtension, _, _ = load_torch_build_bits()

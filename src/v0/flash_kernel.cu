@@ -1,7 +1,7 @@
 #include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
 
-#include "flash_cuda_helpers.cuh"
+#include "flash_kernel_helpers.cuh"
 #include "softmax.cuh"
 #include <cmath>
 #include <cstddef>

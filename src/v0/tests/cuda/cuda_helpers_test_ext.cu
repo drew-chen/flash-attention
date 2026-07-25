@@ -1,6 +1,6 @@
 #include <c10/cuda/CUDAException.h>
 
-#include "../../flash_cuda_helpers.cuh"
+#include "../../flash_kernel_helpers.cuh"
 #include "../../softmax.cuh"
 
 void transpose_cuda_launch(const float *input,

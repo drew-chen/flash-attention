@@ -29,4 +29,16 @@ inline void check_cuda_float32_contiguous_dim(const torch::Tensor &tensor,
     check_dim(tensor, name, dim);
 }
 
+inline void validate_attention_inputs(const torch::Tensor &q,
+                                      const torch::Tensor &k,
+                                      const torch::Tensor &v) {
+    check_cuda_float32_contiguous_dim(q, "q", 4);
+    check_cuda_float32_contiguous_dim(k, "k", 4);
+    check_cuda_float32_contiguous_dim(v, "v", 4);
+    TORCH_CHECK(k.sizes() == v.sizes(), "k and v must have identical shape [B, H, N, D]");
+    TORCH_CHECK(q.size(0) == k.size(0), "q and k must have the same batch size");
+    TORCH_CHECK(q.size(1) == k.size(1), "q and k must have the same number of heads");
+    TORCH_CHECK(q.size(3) == k.size(3), "q and k must have the same head dimension");
+}
+
 }  // namespace flash_attention::detail

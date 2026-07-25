@@ -17,18 +17,6 @@ torch::Tensor flash_forward_v3_pytorch_cuda(const torch::Tensor &q,
                                             const torch::Tensor &k,
                                             const torch::Tensor &v);
 
-// Validates the public contract for flash_attention_v3.forward(...):
-// CUDA float32 contiguous attention tensors: q [B, H, M, D] and k/v [B, H, N, D].
-void validate_flash_inputs(const torch::Tensor &q, const torch::Tensor &k, const torch::Tensor &v) {
-    flash_attention::detail::check_cuda_float32_contiguous_dim(q, "q", 4);
-    flash_attention::detail::check_cuda_float32_contiguous_dim(k, "k", 4);
-    flash_attention::detail::check_cuda_float32_contiguous_dim(v, "v", 4);
-    TORCH_CHECK(k.sizes() == v.sizes(), "k and v must have identical shape [B, H, N, D]");
-    TORCH_CHECK(q.size(0) == k.size(0), "q and k must have the same batch size");
-    TORCH_CHECK(q.size(1) == k.size(1), "q and k must have the same number of heads");
-    TORCH_CHECK(q.size(3) == k.size(3), "q and k must have the same head dimension");
-}
-
 torch::Tensor call_v2(const char *entrypoint,
                       const torch::Tensor &q,
                       const torch::Tensor &k,
@@ -39,7 +27,7 @@ torch::Tensor call_v2(const char *entrypoint,
 }
 
 torch::Tensor flash_forward_v3(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
-    validate_flash_inputs(q, k, v);
+    detail::validate_attention_inputs(q, k, v);
     if (q.size(3) != 64) {
         return call_v2("forward", q, k, v);
     }
