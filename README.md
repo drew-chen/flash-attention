@@ -80,9 +80,11 @@ grid. It launches one block per `(batch, head)`, which gives us only 48 blocks
 for this benchmark. The RTX 4080 has 76 SMs, so some of them never get any work.
 
 Shared memory also limits how many blocks can run on each SM. The kernel could
-reach eight active warps per SM in theory, but I measured only four. The next
-step is to split the work into independent query tiles like FA2 instead of trying
-to tune a launch with only 48 blocks.
+reach eight active warps per SM in theory, but I measured only four. With so few
+active warps, the SM has little other work available while instructions or
+memory accesses are waiting, resulting in poor latency hiding. The next step is
+to split the work into independent query tiles like FA2 instead of trying to
+tune a launch with only 48 blocks.
 
 ### V2: Simplified FlashAttention-2
 
@@ -99,15 +101,15 @@ to tune a launch with only 48 blocks.
 
 V2 adds FA2-style query tiles and gives each warp complete score rows. That
 raises the grid from 48 blocks to 1,536, so there is plenty of work for every SM.
-The catch is that it still keeps `m`, `l`, `O`, and the temporary softmax state
-in shared memory along with the Q/K/V and S/P tiles.
+Unfortunately, despite this better grid organization, per-SM occupancy remains
+low because V2 still keeps `m`, `l`, `O`, and the temporary softmax state in
+shared memory along with the Q/K/V and S/P tiles.
 
 That adds up to 58.37 KB of dynamic shared memory per block, or 59.39 KB after
-including the driver's 1.02 KB reservation. Only one 128-thread block, or four
-warps, can run on an SM at a time. Theoretical occupancy is 8.33% (4 active
-warps / 48 maximum warps per SM), closely matching the measured 8.35%. The
-clear next step is to move the running softmax state and output into registers
-and reuse the shared buffers.
+including the driver's 1.02 KB reservation. As a result, each SM can hold only
+one 128-thread block, or four resident warps. Theoretical occupancy is 8.33%,
+closely matching the measured 8.35%. The clear next step is to move the running
+softmax state and output into registers and reuse the shared buffers.
 
 ### V3: Warp-local FlashAttention-2
 
@@ -141,10 +143,10 @@ sP:    64 × 32 = 2,048 floats
 total: 8,192 floats × 4 bytes = 32,768 bytes
 ```
 
-With 80 registers per thread, an SM can run three blocks. That gives us 24
+With 80 registers per thread, a SM can run three blocks. That gives us 24
 active warps out of 48, so theoretical occupancy is 50% (measured 48.44%).
 
-The block size is important because the GPU places a whole block on an SM. A
+The block size is important because the GPU places a whole block on a SM. A
 256-thread block gives us the 8 warps needed for this row mapping while
 still letting three blocks fit.
 
@@ -176,15 +178,8 @@ Using aligned vector copies for Q, K, and V cut latency from 7,778.20 µs to
 
 I also pad each shared K row from 64 to 65 floats. This stops the QK reads from
 hitting the same shared-memory bank and cut latency from 7,243.62 µs to
-5,393.84 µs. That saved another 1,849.78 µs or 25.5%. The padding changes the
-shared-memory calculation to:
-
-```text
-sQ:    64 × 64 = 4,096 floats
-sK/V:  32 × 65 = 2,080 floats
-sP:    64 × 32 = 2,048 floats
-total: 8,224 floats × 4 bytes = 32,896 bytes
-```
+5,393.84 µs. That saved another 1,849.78 µs or 25.5%. The padding adds 32
+floats, increasing dynamic shared memory from 32,768 to 32,896 bytes.
 
 Using `int` selectively for bounded tile, row, warp, lane, and loop indices
 provided another substantial gain while retaining `std::size_t` for global
@@ -195,7 +190,7 @@ while the explicitly widened global offsets can still address the complete
 tensors.
 
 The next things to try are tensor-core MMA for QK and PV, and some careful
-register-tile tuning that still lets more than one block fit on an SM.
+register-tile tuning that still lets more than one block fit on a SM.
 
 ## Commands
 
@@ -328,6 +323,11 @@ Print the roofline overview:
   --section SpeedOfLight_RooflineChart \
   --print-details all
 ```
+
+## Extended notes
+
+- [V1 extended notes](docs/v1-extended-notes.md)
+- [V2 extended notes](docs/v2-extended-notes.md)
 
 ## Sources
 

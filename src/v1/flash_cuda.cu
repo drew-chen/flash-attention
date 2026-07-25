@@ -6,18 +6,6 @@
 #include <limits>
 
 /*
-In these notes, a tiled flash attention is constructed step-by-step from
-normal attention. These notes skip how the reccurence relation used
-is derived.
-
-Algorithms:
-1. Standard attention
-2. Single-row, two-pass online-softmax attention
-3. Single-row, single-pass online-softmax attention
-4. FlashAttention (tiled)
-
-Algorithm 4 is the one that is implemented.
-
 flash_forward_cuda_launch expects raw pointers for tensors shaped as:
 
 - q: [B, H, N, D]
@@ -42,93 +30,9 @@ Dimensions:
 Assumes self-attention: q, k, v are CUDA float32 contiguous tensors with the same
 shape [B, H, N, D], so M = N = seq_len.
 
-Indexing convention: tensor indices are zero-based. A loop over N elements uses
-i = 0 to N - 1. Recurrence state 0 is the empty-prefix state, so processing
-tensor element i advances recurrence state i to state i + 1.
-
-1. Standard attention algorithm:
-
-S = QK^T / sqrt(D) (pre-softmax logits, ie, score)
-P = row_softmax(S) (attention probabilities/weight matrix)
-O = PV  (self-attention output)
-
-
-2. Single-row, two-pass online-softmax attention:
-
-Algorithm for one row of output O[b, h, k, :], with b, h, and query row k fixed.
-This algorithm avoids materializing the full attention matrix, but saves one score row x.
-
-Notes taken from Zihao Ye's "From Online Softmax to FlashAttention".
-
-Derivation of online softmax's recurrence relation is not shown.
-
-
-Pass 1:
-
-Initialize:
-    m_0 = -infinity  # Running maximum of the processed logits.
-    l_0 = 0          # Running numerically stable softmax denominator.
-
-for i = 0 to N - 1:
-    x_i = dot(Q[k, :], K[i, :]) / sqrt(D)  # Scalar logit for query k and the current key i.
-    m_{i+1} = max(m_i, x_i)                # Running maximum for the score row.
-    l_{i+1} = l_i*e^(m_i - m_{i+1})        # Update the running max-shifted softmax normalizer.
-            + e^(x_i - m_{i+1})
-save x_i values for this score row
-
-Pass 2:
-
-Initialize:
-    o_0 = zeros(D)  # Running partial attention-output row vector.
-
-for i = 0 to N - 1:
-    a_i = e^(x_i - m_N)/l_N         # Calculate the numerically stable attention weight.
-
-    o_{i+1} = o_i + a_i*V[i, :]     # Accumulate the weighted value row.
-                                    # Over N iterations, this is equivalent to row vector
-                                    # a * matrix V, since the full attention-weight row
-                                    # a is dotted with each column of V;
-                                    # equivalently, each row V[i, :] is scaled by a_i
-                                    # before the rows are summed.
-
-    O[b, h, k, :] = o_N             # Save row vector output
-
-
-3. Single-row, single-pass online-softmax attention
-
-Using a flash attention recurrence relationship yields:
-
-Initialize:
-    m_0 = -infinity  # Running maximum of the processed logits.
-    l_0 = 0          # Running numerically stable softmax denominator.
-    o_0 = zeros(D)   # Running normalized attention-output row vector.
-
-for i = 0 to N - 1:
-    x_i = dot(Q[k, :], K[i, :]) / sqrt(D)           # Scalar logit for query k for each key vector.
-    m_{i+1} = max(m_i, x_i)                         # Update the running maximum.
-    rescaled_l_i = l_i*e^(m_i - m_{i+1})            # If prev max was the same, do nothing,
-                                                    # otherwise, correct it's exponent scale.
-
-    l_{i+1} = rescaled_l_i + e^(x_i - m_{i+1})      # Update attention row's running
-                                                    # sum's softmax denominator.
-
-    old_output_contribution = o_i * l_i * e^(m_i - m_{i+1}) / l_{i+1}
-
-        # Remove prev output's denominator l_i
-        # then correct it's exponent scale and set the newly updated denominator l_{i+1}.
-
-    o_{i+1} = old_output_contribution + (e^(x_i - m_{i+1})/l_{i+1})*V[i, :]
-
-        # Add this row vector to the running sum output row vector
-
-O[b, h, k, :] = o_N                 # Save row vector output
+Extended notes: docs/v1-extended-notes.md
 
 4. FlashAttention (tiled)
-
-Unlike the previous examples, this is for the entire output rather than a row.
-Furthermore, the notation is adjusted from the paper to more closely align with
-CUDA. Furthermore, the subscript annotation is for indexing into block-level
-state rather than for state transitions like above.
 
 Divide Q, K, and V along the sequence dimension and load into shared memory 2D tiles
 of (B_r x D), (B_c x D), and (B_c x D) respectively, where (B_r, B_c) are the
