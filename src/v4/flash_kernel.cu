@@ -1,5 +1,6 @@
 #include "../cuda_utils.h"
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAStream.h>
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -425,7 +426,7 @@ void flash_forward_v4_cuda_launch(const float *gQ,
                                         cudaSharedmemCarveoutMaxShared));
 
     dim3 block{THREAD_BLOCK_SZ};
-    forward_d64<<<grid, block, TileParams::total_bytes>>>(p);
+    forward_d64<<<grid, block, TileParams::total_bytes, c10::cuda::getCurrentCUDAStream()>>>(p);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

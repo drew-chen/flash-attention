@@ -32,6 +32,10 @@ torch::Tensor flash_forward_v2_pytorch_cuda(const torch::Tensor &q,
     // Assumes q is [B, H, M, D] and k/v are [B, H, N, D].
     auto out = torch::empty_like(q);
 
+    if (detail::output_is_empty(q)) {
+        return out;
+    }
+
     const int batch_size = static_cast<int>(q.size(0));
     const int num_heads = static_cast<int>(q.size(1));
     const int query_seq_len = static_cast<int>(q.size(2));

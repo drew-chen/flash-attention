@@ -25,6 +25,7 @@ void validate_flash_inputs(const torch::Tensor &q, const torch::Tensor &k, const
     flash_attention::detail::check_cuda_float32_contiguous_dim(v, "v", 4);
     TORCH_CHECK(q.sizes() == k.sizes(), "q and k must have identical shape [B, H, N, D]");
     TORCH_CHECK(q.sizes() == v.sizes(), "q and v must have identical shape [B, H, N, D]");
+    TORCH_CHECK(q.size(2) > 0, "sequence length N must be greater than zero");
 }
 
 torch::Tensor flash_forward_v0(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
@@ -41,6 +42,10 @@ torch::Tensor flash_forward_v0_pytorch_cuda(const torch::Tensor &q,
                                             const torch::Tensor &v) {
     // Assumes the validated contiguous self-attention [B, H, N, D] contract (M = N).
     auto out = torch::empty_like(q);
+
+    if (detail::output_is_empty(q)) {
+        return out;
+    }
 
     const int batch_size = static_cast<int>(q.size(0));
     const int num_heads = static_cast<int>(q.size(1));
