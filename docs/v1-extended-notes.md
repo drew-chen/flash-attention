@@ -38,14 +38,16 @@ Indexing convention: tensor indices are zero-based. A loop over N elements uses
 i = 0 to N - 1. Recurrence state 0 is the empty-prefix state, so processing
 tensor element i advances recurrence state i to state i + 1.
 
-1. Standard attention algorithm:
+## 1. Standard attention algorithm:
 
+```text
 S = QK^T / sqrt(D) (pre-softmax logits, i.e., scores)
 P = row_softmax(S) (attention probabilities/weight matrix)
 O = PV  (attention output)
+```
 
 
-2. Single-row, two-pass online-softmax attention:
+## 2. Single-row, two-pass online-softmax attention:
 
 Algorithm for one row of output O[b, h, k, :], with b, h, and query row k fixed.
 This algorithm avoids materializing the full attention matrix, but saves one score row x.
@@ -55,8 +57,9 @@ Notes taken from Zihao Ye's "From Online Softmax to FlashAttention".
 Derivation of online softmax's recurrence relation is not shown.
 
 
-Pass 1:
+### Pass 1:
 
+```text
 Initialize:
     m_0 = -infinity  # Running maximum of the processed logits.
     l_0 = 0          # Running numerically stable softmax denominator.
@@ -67,9 +70,11 @@ for i = 0 to N - 1:
     l_{i+1} = l_i*e^(m_i - m_{i+1})        # Update the running max-shifted softmax normalizer.
             + e^(x_i - m_{i+1})
 save x_i values for this score row
+```
 
-Pass 2:
+### Pass 2:
 
+```text
 Initialize:
     o_0 = zeros(D)  # Running partial attention-output row vector.
 
@@ -84,12 +89,14 @@ for i = 0 to N - 1:
                                     # before the rows are summed.
 
     O[b, h, k, :] = o_N             # Save row vector output
+```
 
 
-3. Single-row, single-pass online-softmax attention
+## 3. Single-row, single-pass online-softmax attention
 
 Using a flash attention recurrence relationship yields:
 
+```text
 Initialize:
     m_0 = -infinity  # Running maximum of the processed logits.
     l_0 = 0          # Running numerically stable softmax denominator.
@@ -114,8 +121,9 @@ for i = 0 to N - 1:
         # Add this row vector to the running sum output row vector
 
 O[b, h, k, :] = o_N                 # Save row vector output
+```
 
-4. FlashAttention (tiled)
+## 4. FlashAttention (tiled)
 
 Unlike the previous examples, this is for the entire output rather than a row.
 Furthermore, the notation is adjusted from the paper to more closely align with
@@ -128,12 +136,15 @@ dimensions of the score tile calculated by processing the queries, keys, and val
 in the tile.
 
 Ex: Q (M x D) is composed of T_r tiles, labelled Q_i (B_r x D) by stacking along the sequence dim.
+
+```text
 Q = [
     ---Q_0---
     ---Q_1---
     ...
     --- Q_{T_r - 1}
 ]
+```
 
 Through algebra similar to how online-softmax is performed, attention can be performed
 one tile at a time with a running output. Only the current Q and K/V tiles and running
@@ -144,7 +155,7 @@ This avoids operating on all M or N elements at once and eliminates the need to
 materialize the M x N attention score matrix (for self-attention, M = N).
 
 
-Intuition on running state:
+### Intuition on running state:
 
 After iterating over the entire sequence and all blocks, the running output is the same
 as the naive attention output. The running state m_i, l_i, and O_i lives in global
@@ -161,6 +172,7 @@ per-query output perspective but is mathematically equivalent and keeps the heav
 data movement of the K/V tiles on the outer loop rather than inner loop.
 
 
+```text
 Initialize:
     B_c = floor(SRAM_capacity_elements/(4*D))   # Number of score cols and K/V rows
                                                 # processed per data tile.
@@ -304,6 +316,7 @@ for each K/V block j = 0 to T_c - 1:
         # A future optimization is to store the O tile without the li denominator
         # and perform the division on a second pass on the final O tile, reducing # FLOPs
         # otherwise needed to rescale constantly.
+```
 
 ---
 

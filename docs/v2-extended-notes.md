@@ -24,9 +24,9 @@ Dimensions:
 Q, K, and V must be contiguous CUDA float32 tensors with matching batch, head,
 and head-dimension sizes. K and V must have identical shapes; M and N may differ.
 
-FlashAttention-2
+## FlashAttention-2
 
-1. Delay normalizing O by the softmax denominator
+### 1. Delay normalizing O by the softmax denominator
 
 Rather than dividing partial outputs by the updated softmax denominator l_i after
 each K/V tile, store the unnormalized numerator and apply the denominator once at
@@ -34,20 +34,20 @@ the end, prior to writing the final output for a block. The paper calls this out
 "unscaled", though technically the old numerator is still rescaled by
 exp(m_old - m_new) whenever the running maximum changes.
 
-2. Parallelize blocks on the query sequence dimension
+### 2. Parallelize blocks on the query sequence dimension
 
 As seen from the v1 profiling, the v1 algorithm can have poor performance
 as sequence length grows and the batch size decreases. This is addressed
 by dividing the work for a particular [B, H] across multiple query-tile blocks.
 In this implementation, the query-tile index is represented by the grid's z dim.
 
-3. Better warp partitioning
+### 3. Better warp partitioning
 
 This section describes the original optimized FA1 CUDA kernel's warp partitioning,
 as described by the FA2 paper, vs. FA2's warp partitioning. The FA1 paper itself
 describes the tiled algorithm but does not describe this warp-level mapping.
 
-    i) FA1 warp partitioning:
+#### i) FA1 warp partitioning:
 
 The optimized v1 uses the "split-K" approach for matrix multiplication. It uses
 warps to divide the key-sequence dimension B_c, which is the common/reduction
@@ -64,8 +64,10 @@ Note: my implementation of FA1 was simpler and more serial than this.
 
 Ex:
 
+```text
 S_iw = Q_i @ K^T_w          # warp-local score-column slice
 S_i = [S_i1 S_i2 ... S_iw]  # logical concatenation along the col dim
+```
 
 The problem is that calculating the softmax of the score requires communication
 between warps because an entire score row is needed, but each warp only owns a
@@ -73,24 +75,28 @@ column subset of each row.
 
 When later multiplying by V, a similar issue occurs.
 
-    ii) FA2 warp partitioning:
+#### ii) FA2 warp partitioning:
 
 V2 splits the Q data tile such that each warp calculates the result for only a
 row slice of the Q tile while using all of the current K^T and V tile.
 
 Ex:
 
+```text
 S_wi = Q_w @ K^T_i
+```
 
 Since each warp owns full Q rows, that means it also fully owns the corresponding
 rows of the score and attention output. If the warp results were logically combined,
 they would stack by row.
 
+```text
 S_i = [
     S_0i
     ...
     S_wi
 ]
+```
 
 Because attention is independent among score rows, the score and other state such
 as m_i, l_i, and the output are all owned by the warp! So global memory
@@ -100,7 +106,7 @@ implementation, but it is no longer required by the algorithm.
 
 ---
 
-Algorithm:
+## Algorithm:
 
 Due to independent query-row ownership between warps, shared memory for
 intermediate softmax state and output accumulators does not need to be used as
@@ -114,6 +120,7 @@ For the first implementation, shared memory can be used to make this easier.
 Thus, inter-warp operations can be done in shared memory while the rest
 will remain warp local if possible, including borrowing v1's warp reductions.
 
+```text
 Initialize:
     B_c = 32    # Number of score cols and K/V rows
                 # processed per data tile (can be tuned).
@@ -187,6 +194,7 @@ for each K/V block j = 0 to T_c - 1:
 
 # Apply the softmax denominator once after processing every K/V tile.
 O[b, h, i*B_r: min((i + 1)*B_r, M), :] = O_i / l_i
+```
 
 ---
 
