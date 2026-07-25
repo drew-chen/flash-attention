@@ -1,4 +1,9 @@
-"""Expose one attention forward pass as an NVTX range."""
+"""Expose one attention forward pass to NVIDIA Nsight Compute.
+
+`profile.sh` runs this script under `ncu`. The NVTX (NVIDIA Tools
+Extension) range names the forward pass so the profiler can select its kernels
+and exclude setup and warm-up work.
+"""
 
 import argparse
 
@@ -17,9 +22,12 @@ def main():
 
     forward = IMPLEMENTATIONS[implementation]
     q, k, v = make_inputs(SEQ_LEN)
+
+    # Warm up before entering the range selected by the profiler.
     forward(q, k, v)
     torch.cuda.synchronize()
 
+    # profile.sh tells ncu to collect kernels launched in this named NVTX range.
     with torch.cuda.nvtx.range(f"flash_attention.{implementation}"):
         forward(q, k, v)
         torch.cuda.synchronize()
