@@ -77,13 +77,28 @@ def main():
     if not torch.cuda.is_available():
         raise RuntimeError("A CUDA-enabled PyTorch installation and GPU are required.")
 
-    print("| Version | Sequence length | Latency (µs) |")
-    print("| --- | ---: | ---: |")
-    implementations = (
+    implementations = tuple(
         IMPLEMENTATIONS.items()
         if args.implementation == "all"
         else ((args.implementation, IMPLEMENTATIONS[args.implementation]),)
     )
+    sequence_lengths = ", ".join(str(seq_len) for seq_len in args.seq_lens)
+    implementation_names = ", ".join(version for version, _ in implementations)
+
+    print("| Parameter | Value |")
+    print("| --- | --- |")
+    print(f"| Implementations | {implementation_names} |")
+    print(f"| Batch size (B) | {args.batch_size} |")
+    print(f"| Heads (H) | {args.num_heads} |")
+    print(f"| Query lengths (M) | {sequence_lengths} |")
+    print(f"| K/V lengths (N) | {sequence_lengths} |")
+    print(f"| Head dimension (D) | {args.head_dim} |")
+    print(f"| Warmups | {args.warmup} |")
+    print(f"| Timed calls | {args.repetitions} |")
+    print()
+    print("| Version | Dtype | M | N | Latency (µs) |")
+    print("| --- | --- | ---: | ---: | ---: |")
+
     for seq_len in args.seq_lens:
         q, k, v = make_inputs(
             seq_len,
@@ -97,7 +112,7 @@ def main():
                 warmup=args.warmup,
                 repetitions=args.repetitions,
             )
-            print(f"| {version} | {seq_len} | {latency:.2f} |")
+            print(f"| {version} | float32 | {seq_len} | {seq_len} | {latency:.2f} |")
 
 
 if __name__ == "__main__":

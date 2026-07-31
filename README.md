@@ -38,8 +38,8 @@ the resulting upward movement is small on its logarithmic scale.
 
 | Version | Title | Latency (µs) | Δ vs. baseline | Description |
 | --- | --- | ---: | ---: | --- |
-| Baseline | Naive PyTorch | 11940.15 | — | Explicit PyTorch attention used as the correctness and latency reference |
-| SDPA | PyTorch SDPA | 5507.07 | −53.9% | Optimized PyTorch reference with automatic CUDA backend selection |
+| Baseline | Naive PyTorch FP32 | 11940.15 | — | Explicit FP32 PyTorch attention used as the correctness and latency reference |
+| SDPA | PyTorch SDPA FP32 | 5507.07 | −53.9% | Optimized FP32 PyTorch reference with automatic CUDA backend selection |
 | V0 | Naive CUDA | 41232.39 | +245.3% | Unfused CUDA kernels that materialize the attention matrix |
 | V1 | FlashAttention-1 | 241906.59 | +1926.0% | Fused tiled online softmax with one block per batch and head |
 | V2 | Simplified FlashAttention-2 | 128997.28 | +980.4% | FA2-style query-tile parallelism, but most state still lives in shared memory |
