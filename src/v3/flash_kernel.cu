@@ -81,7 +81,7 @@ for each K/V block j = 0 to T_c - 1:
 
     s_K_j = K[b, h, j*B_c: min((j + 1)*B_c, N), :]
 
-        # (B_c x D): Save up to B_c K rows into SRAM.
+        # (B_c x D): Stage up to B_c K rows in shared memory.
 
 
     wS_ij = s_Q_i @ s_K_j^T / sqrt(D)

@@ -49,7 +49,7 @@ Q = [
 
 Through algebra similar to how online-softmax is performed, attention can be performed
 one tile at a time with a running output. Only the current Q and K/V tiles and running
-state slices need to be simultaneously loaded into SRAM.
+state slices need to be simultaneously loaded into shared memory.
 
 
 This avoids us from needing to handle ops with the entire N / M elements loaded per row
@@ -60,7 +60,7 @@ Intuition on running state:
 
 After iterating over the entire sequence / all blocks, the running output is same
 as the naive attention output. The running state m_i, l_i, and O_i lives in global
-memory between tile updates. The current tiles are loaded into SRAM, where m_i and l_i
+memory between tile updates. The current tiles are loaded into shared memory, where m_i and l_i
 have one scalar per query and O_i has one D-element row per query.
 
 The m_i and l_i state must be stored as vectors, not single variables, because we do not
@@ -74,7 +74,7 @@ data movement of the K/V tiles on the outer loop rather than inner loop.
 
 
 Initialize:
-    B_c = floor(SRAM_capacity_elements/(4*D))   # Number of score cols and K/V rows
+    B_c = floor(shared_memory_capacity_elements/(4*D)) # Number of score cols and K/V rows
                                                 # processed per data tile.
     B_r = min(B_c, D)                           # Number of score rows and Q rows
                                                 # processed per data tile.
@@ -100,7 +100,7 @@ for each K/V block j = 0 to T_c - 1:
     K_j = K[j*B_c: min((j + 1)*B_c, N), :]
     V_j = V[j*B_c: min((j + 1)*B_c, N), :]
 
-        # (B_c x D): Save up to B_c rows of K and V into SRAM.
+        # (B_c x D): Save up to B_c rows of K and V into shared memory.
 
     for each Q block i = 0 to T_r - 1:
         # -- Load shared memory 2D tile dim (B_r x D) --
@@ -112,7 +112,7 @@ for each K/V block j = 0 to T_c - 1:
         # the initialized defaults for its first update and globally saved state later.
 
 
-        # -- Calculate the block-local scores using SRAM --
+        # -- Calculate the block-local scores using shared-memory tiles --
 
         S_ij = Q_i @ K_j^T / sqrt(D)
 
@@ -228,7 +228,7 @@ namespace flash_attention {
 namespace {
 
 constexpr int THREAD_BLOCK_SZ = 128;
-// TODO: Reuse SRAM buffers more tightly, then calculate B_R and B_C dynamically.
+// TODO: Reuse shared-memory buffers more tightly, then calculate B_R and B_C dynamically.
 // Data tile size != thread block size
 constexpr std::size_t B_r = 32;
 constexpr std::size_t B_c = 32;
@@ -239,7 +239,7 @@ enum class RhsAccess : std::uint8_t { ROW, COLUMN };
 // Activates all warps in a warp shuffle (all bits 1).
 constexpr unsigned FULL_WARP_MASK = ~0U;
 
-// Stores values and offsets into SRAM tiles
+// Stores values and offsets into shared-memory tiles
 struct TileParams {
     TileParams(const std::size_t M, const std::size_t N, const std::size_t D) {
         TORCH_CHECK(M > 0, "M must be positive");

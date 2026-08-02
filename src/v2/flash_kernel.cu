@@ -62,7 +62,7 @@ for each K/V block j = 0 to T_c - 1:
     s_K_j = K[b, h, j*B_c: min((j + 1)*B_c, N), :]
     s_V_j = V[b, h, j*B_c: min((j + 1)*B_c, N), :]
 
-        # (B_c x D): Save up to B_c rows of K and V into SRAM.
+        # (B_c x D): Save up to B_c rows of K and V into shared memory.
 
 
     s_S_ij = s_Q_i @ s_K_j^T / sqrt(D)
@@ -81,7 +81,7 @@ for each K/V block j = 0 to T_c - 1:
 
         # (B_r x B_c) Calculate running probabilities using the updated max
         # though skip applying softmax denominator here. This can re-use
-        # S_ij allocated sram.
+        # the shared-memory buffer allocated for S_ij.
 
 
     w_m_i_rescale_factor = exp(w_m_i - w_mnew_i)
@@ -120,7 +120,7 @@ namespace flash_attention {
 namespace {
 
 constexpr int THREAD_BLOCK_SZ = 128;
-// TODO: Reuse SRAM buffers more tightly, then calculate B_R and B_C dynamically.
+// TODO: Reuse shared-memory buffers more tightly, then calculate B_R and B_C dynamically.
 // Data tile size != thread block size
 constexpr std::size_t B_r = 64;
 constexpr std::size_t B_c = 32;
@@ -136,7 +136,7 @@ enum class RhsAccess : std::uint8_t { ROW, COLUMN };
 // Activates all warps in a warp shuffle (all bits 1).
 constexpr unsigned FULL_WARP_MASK = ~0U;
 
-// Stores values and offsets into SRAM tiles
+// Stores values and offsets into shared-memory tiles
 struct TileParams {
     TileParams(const std::size_t M, const std::size_t N, const std::size_t D) {
         TORCH_CHECK(M > 0, "M must be positive");
