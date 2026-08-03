@@ -48,10 +48,11 @@ the resulting upward movement is small on its logarithmic scale.
 
 At `M=N=2048`, V4 was 1,696.77 µs, or 30.8%, faster than SDPA.
 
-The CUDA implementations accept contiguous CUDA `float32` tensors. V0 requires self-attention
-with `M = N`. V1–V4 accept Q `[B, H, M, D]` and K/V `[B, H, N, D]`.
-V3 and V4 hardcode their CUDA kernels to `D=64` for simplicity and redirect
-other head dimensions to V2.
+V0–V4 accept contiguous CUDA `float32` tensors. V4 FP16 accepts and returns `float16`.
+V0 requires self-attention with `M = N`. V1–V4, including V4 FP16, accept Q `[B, H, M, D]`
+and K/V `[B, H, N, D]`. V3 and V4 hardcode their CUDA kernels to `D=64` for
+simplicity and redirect other head dimensions to V2. V4 FP16 supports only `D=64` and rejects
+unsupported inputs rather than falling back.
 
 ## Notes
 
@@ -192,6 +193,39 @@ tensors.
 The next things to try are tensor-core MMA for QK and PV, and some careful
 register-tile tuning that still lets more than one block fit on a SM.
 
+### V4 FP16: FP16 storage baseline
+
+V4 FP16 keeps V4's scalar algorithm as a storage baseline for tensor cores. Q,
+K, V, shared P, and the output use FP16; scores, softmax, and accumulations stay
+FP32.
+
+| Implementation | Max abs | Mean abs | RMSE | Relative L2 |
+| --- | ---: | ---: | ---: | ---: |
+| V4 FP32 | 9.239e-7 | 2.928e-8 | 4.201e-8 | 1.156e-6 |
+| V4 FP16 | 1.098e-4 | 7.862e-6 | 1.025e-5 | 2.819e-4 |
+
+`python accuracy.py` produced these against the FP32 PyTorch reference at
+`B=4, H=12, M=N=2048, D=64` with seed 0. The FP32 reference and V4 receive the
+same FP16 inputs promoted to FP32, so the comparison excludes initial input
+rounding. Max error captures the worst element, mean error captures typical
+error, RMSE weights larger errors more, and relative L2 normalizes total error
+by the reference magnitude. These are measurements, not error bounds.
+
+V4 FP16 took 4,115.77 µs versus V4's 3,770.62 µs, so it was 9.2% slower.
+V4 is already compute-bound, and V4 FP16 still performs scalar FP32 `FFMA`s
+after converting FP16 operands inside QK and PV. The smaller shared allocation
+does not improve residency: 72 registers per thread still limit both versions
+to three blocks per SM and 50% theoretical occupancy.
+
+The final SASS confirmed three `LDG.E.128` Q/K/V loads and explicit
+`HADD2.F32`/`F2F` conversions. This shows that the conversions exist, not that
+they are the sole cause of the regression:
+
+```bash
+cuobjdump --dump-sass flash_attention_v4_fp16*.so \
+  | rg 'LDG|HADD2|F2F'
+```
+
 ## Commands
 
 ### Setup
@@ -231,6 +265,34 @@ For CUDA memory checks:
 compute-sanitizer --target-processes all python -m pytest -q
 ```
 
+### Accuracy
+
+`accuracy.py` compares V4 and V4 FP16 with the FP32 PyTorch reference and
+reports max absolute error, mean absolute error, RMSE, and relative L2 error.
+Run both implementations:
+
+```bash
+python accuracy.py
+```
+
+Or measure only V4 FP16:
+
+```bash
+python accuracy.py v4-fp16
+```
+
+The shape and random seed can be overridden:
+
+```bash
+python accuracy.py v4-fp16 \
+  --batch-size 1 \
+  --num-heads 12 \
+  --query-seq-len 1024 \
+  --kv-seq-len 1024 \
+  --head-dim 64 \
+  --seed 0
+```
+
 ### Benchmarks
 
 The fixed suite measures `M=N=512, 1024, 2048` at `B=4, H=12, D=64`, using 25 warmups and 100
@@ -249,7 +311,7 @@ python benchmark.py v4
 ```
 
 The required implementation argument accepts `all`, `baseline`, `sdpa`, and
-`v0` through `v4`.
+`v0` through `v4`, plus `v4-fp16`.
 
 The shape and timing counts can be overridden for larger, shorter benchmark runs:
 

@@ -9,6 +9,7 @@ import flash_attention_v1
 import flash_attention_v2
 import flash_attention_v3
 import flash_attention_v4
+import flash_attention_v4_fp16
 from src.baseline import forward as baseline_forward
 
 BATCH_SIZE = 4
@@ -31,6 +32,7 @@ IMPLEMENTATIONS = {
     "v2": flash_attention_v2.forward_unchecked,
     "v3": flash_attention_v3.forward_unchecked,
     "v4": flash_attention_v4.forward_unchecked,
+    "v4-fp16": flash_attention_v4_fp16.forward_unchecked,
 }
 
 
@@ -39,8 +41,9 @@ def make_inputs(
     batch_size=BATCH_SIZE,
     num_heads=NUM_HEADS,
     head_dim=HEAD_DIM,
+    dtype=torch.float32,
 ):
-    q = torch.randn(batch_size, num_heads, seq_len, head_dim, device="cuda")
+    q = torch.randn(batch_size, num_heads, seq_len, head_dim, device="cuda", dtype=dtype)
     return q, torch.randn_like(q), torch.randn_like(q)
 
 
@@ -100,19 +103,22 @@ def main():
     print("| --- | --- | ---: | ---: | ---: |")
 
     for seq_len in args.seq_lens:
-        q, k, v = make_inputs(
-            seq_len,
-            batch_size=args.batch_size,
-            num_heads=args.num_heads,
-            head_dim=args.head_dim,
-        )
         for version, forward in implementations:
+            dtype = torch.float16 if version == "v4-fp16" else torch.float32
+            q, k, v = make_inputs(
+                seq_len,
+                batch_size=args.batch_size,
+                num_heads=args.num_heads,
+                head_dim=args.head_dim,
+                dtype=dtype,
+            )
             latency = time_cuda_call(
                 lambda: forward(q, k, v),
                 warmup=args.warmup,
                 repetitions=args.repetitions,
             )
-            print(f"| {version} | float32 | {seq_len} | {seq_len} | {latency:.2f} |")
+            dtype_name = str(dtype).removeprefix("torch.")
+            print(f"| {version} | {dtype_name} | {seq_len} | {seq_len} | {latency:.2f} |")
 
 
 if __name__ == "__main__":

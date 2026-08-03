@@ -5,7 +5,7 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 python_bin="$repo_root/.venv/bin/python"
 ncu_bin="${FLASH_ATTN_NCU_BIN:-/usr/local/cuda/bin/ncu}"
-fused_implementations=(v1 v2 v3 v4)
+fused_implementations=(v1 v2 v3 v4 v4-fp16)
 
 usage() {
   cat <<EOF
@@ -14,7 +14,7 @@ Usage: $0 <implementation|all>
 Profile a fused FlashAttention kernel with NVIDIA Nsight Compute.
 
 Arguments:
-  v1, v2, v3, v4  Profile one implementation.
+  v1, v2, v3, v4, v4-fp16,  Profile one implementation.
   all             Profile every fused implementation.
 
 Examples:
@@ -62,7 +62,7 @@ case "$1" in
       profile_implementation "$implementation"
     done
     ;;
-  v1|v2|v3|v4)
+  v1|v2|v3|v4|v4-fp16)
     profile_implementation "$1"
     ;;
   *)

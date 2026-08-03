@@ -7,7 +7,7 @@ from setuptools import setup
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CUDA_ARCH_LIST = "8.9"
-
+VERSION_SUFFIXES = ("0", "1", "2", "3", "4", "4_fp16")
 
 def fail(message):
     raise SystemExit(f"\n[flash-attention setup] {message}\n")
@@ -77,7 +77,7 @@ def build_extension_modules():
             },
         )
 
-    return [make_flash_extension(version) for version in range(5)]
+    return [make_flash_extension(version) for version in VERSION_SUFFIXES]
 
 
 _, BuildExtension, _, _ = load_torch_build_bits()
