@@ -69,7 +69,6 @@ Initialize:
 warp = threadIdx.x / WARP_SIZE
 lane = threadIdx.x % WARP_SIZE
 warp_row_start = warp * WARP_TILE_ROWS
-warp_rows = warp_row_start : warp_row_start + WARP_TILE_ROWS
 
     # Each thread block processes a Q slice with shape up to (B_r x D) and
     # produces the matching output rows. Its warps partition those rows, with
@@ -116,7 +115,8 @@ for each K/V block j = 0 to T_c - 1:
         # (B_c x D): Stage up to B_c K rows in shared memory.
 
 
-    wS_ij = sQ_i[warp_rows, :] @ sK_j[lane, :] * SOFTMAX_SCALE
+    wS_ij = sQ_i[warp_row_start : warp_row_start + WARP_TILE_ROWS, :]
+              @ sK_j[lane, :] * SOFTMAX_SCALE
 
         # (WARP_TILE_ROWS): Each lane computes one score for each of its warp's
         # Q rows against global K row j*B_c + lane. Together, all lanes compute
@@ -130,7 +130,7 @@ for each K/V block j = 0 to T_c - 1:
     wM_i_new_replicated = max(wM_i_replicated, key_tile_row_max)
 
     p = exp(wS_ij - wM_i_new_replicated)
-    sP_ij_unnormalized[warp_rows, lane] = p
+    sP_ij_unnormalized[warp_row_start : warp_row_start + WARP_TILE_ROWS, lane] = p
 
         # Each lane writes one P value per warp-owned Q row. Together, the
         # block materializes the (B_r x B_c) P tile in shared memory.
@@ -158,18 +158,21 @@ for each K/V block j = 0 to T_c - 1:
         # previously occupied by sK_j.
 
     wO_i_left_unnormalized +=
-        sP_ij_unnormalized[warp_rows, :] @ sV_j[:, lane]
+        sP_ij_unnormalized[warp_row_start : warp_row_start + WARP_TILE_ROWS, :]
+            @ sV_j[:, lane]
     wO_i_right_unnormalized +=
-        sP_ij_unnormalized[warp_rows, :] @ sV_j[:, lane + WARP_SIZE]
+        sP_ij_unnormalized[warp_row_start : warp_row_start + WARP_TILE_ROWS, :]
+            @ sV_j[:, lane + WARP_SIZE]
 
         # Each lane accumulates two (WARP_TILE_ROWS) output vectors. Together,
         # the warp calculates all D=64 output dimensions for its rows.
 
 # Apply the softmax denominator once after processing every K/V tile.
-O[b, h, i*B_r + warp_rows, lane] =
+O[b, h, i*B_r + warp_row_start : i*B_r + warp_row_start + WARP_TILE_ROWS, lane] =
     wO_i_left_unnormalized / wL_i_replicated
 
-O[b, h, i*B_r + warp_rows, lane + WARP_SIZE] =
+O[b, h, i*B_r + warp_row_start : i*B_r + warp_row_start + WARP_TILE_ROWS,
+  lane + WARP_SIZE] =
     wO_i_right_unnormalized / wL_i_replicated
 
     # Each lane normalizes and stores its two output dimensions. Stores outside
@@ -347,10 +350,12 @@ template <ReductionOp Op> __device__ float warp_allreduce(float initial_value) {
  *
  * The warp logically computes
  *
- *     S_ij = sQ_i[warp_rows, :] @ sK_j^T
+ *     S_ij[row_start : row_start + WARP_TILE_ROWS, :]
+ *         = sQ_i[row_start : row_start + WARP_TILE_ROWS, :] @ sK_j^T
  *
  * with shape [WARP_TILE_ROWS, D] @ [D, B_c] = [WARP_TILE_ROWS, B_c].
  * B_c equals WARP_SIZE, so lane l computes column l of S_ij.
+ * Returns wS_ij which contains S_ij[:, lane].
  */
 __device__ std::array<float, WARP_TILE_ROWS> score_ij(const float *const sQ_i,
                                                       const float *const sK_j,
@@ -365,9 +370,9 @@ __device__ std::array<float, WARP_TILE_ROWS> score_ij(const float *const sQ_i,
     // one column of S_ij.
     for (std::size_t d = 0; d < HEAD_DIM; ++d) {
         const float key = sK_j[(lane * HEAD_DIM) + d];
-        for (std::size_t owned_row = 0; owned_row < WARP_TILE_ROWS; ++owned_row) {
-            const std::size_t row = row_start + owned_row;
-            wS_ij[owned_row] += sQ_i[(row * HEAD_DIM) + d] * key;
+        for (std::size_t warp_row = 0; warp_row < WARP_TILE_ROWS; ++warp_row) {
+            const std::size_t row = row_start + warp_row;
+            wS_ij[warp_row] += sQ_i[(row * HEAD_DIM) + d] * key;
         }
     }
     return wS_ij;
@@ -387,26 +392,26 @@ __device__ void online_softmax_ij(float *const sP_ij_unnormalized,
                                   float (&wL_i_replicated)[WARP_TILE_ROWS],
                                   float (&wO_i_left_unnormalized)[WARP_TILE_ROWS],
                                   float (&wO_i_right_unnormalized)[WARP_TILE_ROWS]) {
-    for (std::size_t owned_row = 0; owned_row < WARP_TILE_ROWS; ++owned_row) {
-        const std::size_t row = row_start + owned_row;
+    for (std::size_t warp_row = 0; warp_row < WARP_TILE_ROWS; ++warp_row) {
+        const std::size_t row = row_start + warp_row;
         const bool query_valid = query_start + row < M;
-        wS_ij[owned_row] = query_valid && key_valid ? wS_ij[owned_row] * SOFTMAX_SCALE
-                                                    : -std::numeric_limits<float>::infinity();
+        wS_ij[warp_row] = query_valid && key_valid ? wS_ij[warp_row] * SOFTMAX_SCALE
+                                                   : -std::numeric_limits<float>::infinity();
 
         // Each lane contributes its score for one K row in the current tile.
         // The reductions produce this Q row's max and sum for the current K
         // tile, then broadcast each result back to every lane.
-        const float key_tile_row_max = warp_allreduce<ReductionOp::MAX>(wS_ij[owned_row]);
+        const float key_tile_row_max = warp_allreduce<ReductionOp::MAX>(wS_ij[warp_row]);
         const float m_new =
-            query_valid ? fmaxf(wM_i_replicated[owned_row], key_tile_row_max) : 0.0F;
-        const float p_value = query_valid && key_valid ? expf(wS_ij[owned_row] - m_new) : 0.0F;
+            query_valid ? fmaxf(wM_i_replicated[warp_row], key_tile_row_max) : 0.0F;
+        const float p_value = query_valid && key_valid ? expf(wS_ij[warp_row] - m_new) : 0.0F;
         const float key_tile_row_sum = warp_allreduce<ReductionOp::SUM>(p_value);
-        const float old_scale = query_valid ? expf(wM_i_replicated[owned_row] - m_new) : 0.0F;
+        const float old_scale = query_valid ? expf(wM_i_replicated[warp_row] - m_new) : 0.0F;
 
-        wL_i_replicated[owned_row] = (old_scale * wL_i_replicated[owned_row]) + key_tile_row_sum;
-        wO_i_left_unnormalized[owned_row] *= old_scale;
-        wO_i_right_unnormalized[owned_row] *= old_scale;
-        wM_i_replicated[owned_row] = m_new;
+        wL_i_replicated[warp_row] = (old_scale * wL_i_replicated[warp_row]) + key_tile_row_sum;
+        wO_i_left_unnormalized[warp_row] *= old_scale;
+        wO_i_right_unnormalized[warp_row] *= old_scale;
+        wM_i_replicated[warp_row] = m_new;
         sP_ij_unnormalized[(row * B_c) + lane] = p_value;
     }
 }
@@ -416,7 +421,7 @@ __device__ void online_softmax_ij(float *const sP_ij_unnormalized,
  *
  * The warp logically computes
  *
- *     wO += sP_ij_unnormalized[warp_rows, :] @ sV_j
+ *     wO += sP_ij_unnormalized[row_start : row_start + WARP_TILE_ROWS, :] @ sV_j
  *
  * with shape [WARP_TILE_ROWS, B_c] @ [B_c, D] = [WARP_TILE_ROWS, D].
  */
@@ -431,11 +436,11 @@ __device__ void accumulate_PV_into_O_i(
         // Each lane computes two output columns so all 32 lanes span D=64.
         const float value_left = sV_j[(key_row * HEAD_DIM) + lane];
         const float value_right = sV_j[(key_row * HEAD_DIM) + lane + WARP_SIZE];
-        for (std::size_t owned_row = 0; owned_row < WARP_TILE_ROWS; ++owned_row) {
-            const std::size_t row = row_start + owned_row;
+        for (std::size_t warp_row = 0; warp_row < WARP_TILE_ROWS; ++warp_row) {
+            const std::size_t row = row_start + warp_row;
             const float p_value = sP_ij_unnormalized[(row * B_c) + key_row];
-            wO_i_left_unnormalized[owned_row] += p_value * value_left;
-            wO_i_right_unnormalized[owned_row] += p_value * value_right;
+            wO_i_left_unnormalized[warp_row] += p_value * value_left;
+            wO_i_right_unnormalized[warp_row] += p_value * value_right;
         }
     }
 }
@@ -453,14 +458,14 @@ __device__ void normalize_and_save_O_i(const FlashForwardKernelParams &p,
     const std::size_t batch_head =
         (static_cast<std::size_t>(blockIdx.x) * p.H) + static_cast<std::size_t>(blockIdx.y);
     const std::size_t output_head_offset = batch_head * p.M * HEAD_DIM;
-    for (std::size_t owned_row = 0; owned_row < WARP_TILE_ROWS; ++owned_row) {
-        const std::size_t global_row = query_start + row_start + owned_row;
+    for (std::size_t warp_row = 0; warp_row < WARP_TILE_ROWS; ++warp_row) {
+        const std::size_t global_row = query_start + row_start + warp_row;
         if (global_row < p.M) {
             const std::size_t output_row_offset = output_head_offset + (global_row * HEAD_DIM);
             p.gO[output_row_offset + lane] =
-                wO_i_left_unnormalized[owned_row] / wL_i_replicated[owned_row];
+                wO_i_left_unnormalized[warp_row] / wL_i_replicated[warp_row];
             p.gO[output_row_offset + lane + WARP_SIZE] =
-                wO_i_right_unnormalized[owned_row] / wL_i_replicated[owned_row];
+                wO_i_right_unnormalized[warp_row] / wL_i_replicated[warp_row];
         }
     }
 }
@@ -516,7 +521,7 @@ __global__ void forward_d64(FlashForwardKernelParams p) {
         const bool key_valid = (key_tile * B_c) + lane < p.N;
         // For every Q row owned by this warp, wS_ij stores this lane's score
         // against the K tile row with the same index as the lane.
-        std::array<float, WARP_TILE_ROWS> wS_ij = score_ij(sQ_i, sK_j, row_start, lane, key_valid);
+        auto wS_ij = score_ij(sQ_i, sK_j, row_start, lane, key_valid);
         online_softmax_ij(sP_ij_unnormalized, p.M, query_start, row_start, lane, key_valid, wS_ij,
                           wM_i_replicated, wL_i_replicated, wO_i_left_unnormalized,
                           wO_i_right_unnormalized);

@@ -76,8 +76,7 @@ constexpr int WARP_SIZE = 32;
 constexpr int HEAD_DIM = 64;
 // C++20's std::sqrt is not constexpr, so spell out 1 / sqrt(64).
 constexpr float SOFTMAX_SCALE = 1.0F / 8.0F;
-// Shared-memory banks are four bytes wide, so padding each half row by two
-// elements makes lanes reading one K column use different banks.
+// Offset consecutive K rows by one shared-memory bank width.
 constexpr int K_SHARED_STRIDE = HEAD_DIM + 2;
 constexpr int THREAD_BLOCK_SZ = 256;
 constexpr int NUM_WARPS = THREAD_BLOCK_SZ / WARP_SIZE;
@@ -114,7 +113,7 @@ struct FlashForwardKernelParams {
     const int N;           // K/V sequence length.
 };
 
-// CUDA says, "Global memory instructions support reading or writing words of
+// "Global memory instructions support reading or writing words of
 // size equal to 1, 2, 4, 8, or 16 bytes." Such an access compiles to one global
 // memory instruction only when naturally aligned. Eight halves form a supported
 // 16-byte word, but a plain half[8] aggregate is only 2-byte aligned, so
@@ -242,9 +241,11 @@ template <ReductionOp Op> __device__ __forceinline__ float warp_allreduce(float 
  *
  * The warp logically computes
  *
- *     S_ij = sQ_i[warp_rows, :] @ sK_j^T
+ *     S_ij[row_start : row_start + WARP_TILE_ROWS, :]
+ *         = sQ_i[row_start : row_start + WARP_TILE_ROWS, :] @ sK_j^T
  *
  * with shape [WARP_TILE_ROWS, D] @ [D, B_c] = [WARP_TILE_ROWS, B_c].
+ * Returns wS_ij which contains S_ij[:, lane].
  */
 __device__ __forceinline__ std::array<float, WARP_TILE_ROWS>
 score_ij(const half *const sQ_i,
@@ -257,12 +258,12 @@ score_ij(const half *const sQ_i,
         return wS_ij;
     }
 
-    for (int k = 0; k < HEAD_DIM; ++k) {
-        const float key = __half2float(sK_j[(lane * K_SHARED_STRIDE) + k]);
-        for (int owned_row = 0; owned_row < WARP_TILE_ROWS; ++owned_row) {
-            const int row = row_start + owned_row;
-            const float query = __half2float(sQ_i[(row * HEAD_DIM) + k]);
-            wS_ij[owned_row] += query * key;
+    for (int d = 0; d < HEAD_DIM; ++d) {
+        const float key = __half2float(sK_j[(lane * K_SHARED_STRIDE) + d]);
+        for (int warp_row = 0; warp_row < WARP_TILE_ROWS; ++warp_row) {
+            const int row = row_start + warp_row;
+            const float query = __half2float(sQ_i[(row * HEAD_DIM) + d]);
+            wS_ij[static_cast<std::size_t>(warp_row)] += query * key;
         }
     }
     return wS_ij;
@@ -282,26 +283,27 @@ __device__ __forceinline__ void online_softmax_ij(half *const sP_ij_unnormalized
                                                   float (&wL_i_replicated)[WARP_TILE_ROWS],
                                                   float (&wO_i_left_unnormalized)[WARP_TILE_ROWS],
                                                   float (&wO_i_right_unnormalized)[WARP_TILE_ROWS]) {
-    for (int owned_row = 0; owned_row < WARP_TILE_ROWS; ++owned_row) {
-        const int row = row_start + owned_row;
+    for (int warp_row = 0; warp_row < WARP_TILE_ROWS; ++warp_row) {
+        const int row = row_start + warp_row;
         const bool query_valid = query_start + row < M;
-        wS_ij[owned_row] = query_valid && key_valid ? wS_ij[owned_row] * SOFTMAX_SCALE
-                                                    : -std::numeric_limits<float>::infinity();
+        float &score = wS_ij[static_cast<std::size_t>(warp_row)];
+        score = query_valid && key_valid ? score * SOFTMAX_SCALE
+                                         : -std::numeric_limits<float>::infinity();
 
         // Each lane contributes its score against sK_j[lane, :] for this owned
         // Q row. The reductions broadcast the row result back to every lane.
-        const float key_tile_row_max = warp_allreduce<ReductionOp::MAX>(wS_ij[owned_row]);
+        const float key_tile_row_max = warp_allreduce<ReductionOp::MAX>(score);
         const float m_new =
-            query_valid ? fmaxf(wM_i_replicated[owned_row], key_tile_row_max) : 0.0F;
-        const float p_value = query_valid && key_valid ? expf(wS_ij[owned_row] - m_new) : 0.0F;
+            query_valid ? fmaxf(wM_i_replicated[warp_row], key_tile_row_max) : 0.0F;
+        const float p_value = query_valid && key_valid ? expf(score - m_new) : 0.0F;
         const float key_tile_row_sum = warp_allreduce<ReductionOp::SUM>(p_value);
-        const float old_scale = query_valid ? expf(wM_i_replicated[owned_row] - m_new) : 0.0F;
+        const float old_scale = query_valid ? expf(wM_i_replicated[warp_row] - m_new) : 0.0F;
 
-        wL_i_replicated[owned_row] =
-            (old_scale * wL_i_replicated[owned_row]) + key_tile_row_sum;
-        wO_i_left_unnormalized[owned_row] *= old_scale;
-        wO_i_right_unnormalized[owned_row] *= old_scale;
-        wM_i_replicated[owned_row] = m_new;
+        wL_i_replicated[warp_row] =
+            (old_scale * wL_i_replicated[warp_row]) + key_tile_row_sum;
+        wO_i_left_unnormalized[warp_row] *= old_scale;
+        wO_i_right_unnormalized[warp_row] *= old_scale;
+        wM_i_replicated[warp_row] = m_new;
         sP_ij_unnormalized[(row * B_c) + lane] = __float2half_rn(p_value);
     }
 }
@@ -311,7 +313,7 @@ __device__ __forceinline__ void online_softmax_ij(half *const sP_ij_unnormalized
  *
  * The warp logically computes
  *
- *     wO += sP_ij_unnormalized[warp_rows, :] @ sV_j
+ *     wO += sP_ij_unnormalized[row_start : row_start + WARP_TILE_ROWS, :] @ sV_j
  *
  * with shape [WARP_TILE_ROWS, B_c] @ [B_c, D] = [WARP_TILE_ROWS, D].
  */
@@ -326,11 +328,11 @@ __device__ __forceinline__ void accumulate_PV_into_O_i(
         const float value_left = __half2float(sV_j[(key_row * HEAD_DIM) + lane]);
         const float value_right =
             __half2float(sV_j[(key_row * HEAD_DIM) + lane + WARP_SIZE]);
-        for (int owned_row = 0; owned_row < WARP_TILE_ROWS; ++owned_row) {
-            const int row = row_start + owned_row;
+        for (int warp_row = 0; warp_row < WARP_TILE_ROWS; ++warp_row) {
+            const int row = row_start + warp_row;
             const float p_value = __half2float(sP_ij_unnormalized[(row * B_c) + key_row]);
-            wO_i_left_unnormalized[owned_row] += p_value * value_left;
-            wO_i_right_unnormalized[owned_row] += p_value * value_right;
+            wO_i_left_unnormalized[warp_row] += p_value * value_left;
+            wO_i_right_unnormalized[warp_row] += p_value * value_right;
         }
     }
 }
@@ -352,15 +354,15 @@ __device__ __forceinline__ void normalize_and_save_O_i(const FlashForwardKernelP
     const std::size_t output_head_offset =
         static_cast<std::size_t>(batch_head) * static_cast<std::size_t>(p.M) * HEAD_DIM;
     const std::size_t lane_offset = static_cast<std::size_t>(lane);
-    for (int owned_row = 0; owned_row < WARP_TILE_ROWS; ++owned_row) {
-        const int global_row = query_start + row_start + owned_row;
+    for (int warp_row = 0; warp_row < WARP_TILE_ROWS; ++warp_row) {
+        const int global_row = query_start + row_start + warp_row;
         if (global_row < p.M) {
             const std::size_t output_row_offset =
                 output_head_offset + (static_cast<std::size_t>(global_row) * HEAD_DIM);
             p.gO[output_row_offset + lane_offset] = __float2half_rn(
-                wO_i_left_unnormalized[owned_row] / wL_i_replicated[owned_row]);
+                wO_i_left_unnormalized[warp_row] / wL_i_replicated[warp_row]);
             p.gO[output_row_offset + lane_offset + WARP_SIZE] = __float2half_rn(
-                wO_i_right_unnormalized[owned_row] / wL_i_replicated[owned_row]);
+                wO_i_right_unnormalized[warp_row] / wL_i_replicated[warp_row]);
         }
     }
 }
