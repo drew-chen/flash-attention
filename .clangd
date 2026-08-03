@@ -1,5 +1,5 @@
 CompileFlags:
-  Compiler: /usr/bin/clang++
+  Compiler: /usr/bin/clang++-22
   Add:
     # Project diagnostics.
     - -std=c++20
@@ -20,6 +20,8 @@ CompileFlags:
     - /home/achen/.local/share/uv/python/cpython-3.12.13-linux-x86_64-gnu/include/python3.12
     - -isystem
     - /usr/local/cuda/include
+    - -isystem
+    - /usr/local/cuda/include/cccl
 
     # Extension macros.
     - -DTORCH_API_INCLUDE_EXTENSION_H

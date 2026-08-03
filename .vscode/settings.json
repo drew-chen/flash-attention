@@ -5,6 +5,7 @@
     ],
     "python.analysis.typeCheckingMode": "basic",
     "C_Cpp.intelliSenseEngine": "disabled",
+    "clangd.path": "/usr/bin/clangd-22",
     "files.associations": {
         "*.cu": "cuda-cpp",
         "*.cuh": "cuda-cpp"
