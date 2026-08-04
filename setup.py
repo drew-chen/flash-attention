@@ -1,13 +1,14 @@
 import os
 from pathlib import Path
 import sys
+import sysconfig
 
 from setuptools import setup
 
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CUDA_ARCH_LIST = "8.9"
-VERSION_SUFFIXES = ("0", "1", "2", "3", "4", "4_fp16")
+VERSION_SUFFIXES = ("0", "1", "2", "3", "4", "4_fp16", "5")
 
 def fail(message):
     raise SystemExit(f"\n[flash-attention setup] {message}\n")
@@ -50,6 +51,7 @@ def load_torch_build_bits():
 
 def build_extension_modules():
     torch, _, CUDAExtension, CUDA_HOME = load_torch_build_bits()
+    from torch.utils.cpp_extension import include_paths
 
     if CUDA_HOME is None:
         fail(
@@ -63,6 +65,20 @@ def build_extension_modules():
 
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", DEFAULT_CUDA_ARCH_LIST)
 
+    third_party_include_dirs = dict.fromkeys(
+        (
+            *include_paths(device_type="cuda"),
+            sysconfig.get_path("include"),
+            sysconfig.get_path("platinclude"),
+            str(Path(sys.prefix) / "include"),
+        )
+    )
+    system_include_flags = [
+        flag
+        for include_dir in third_party_include_dirs
+        for flag in ("-isystem", include_dir)
+    ]
+
     def make_flash_extension(version):
         version_dir = ROOT / f"src/v{version}"
         return CUDAExtension(
@@ -72,8 +88,8 @@ def build_extension_modules():
                 str(version_dir / "flash_kernel.cu"),
             ],
             extra_compile_args={
-                "cxx": HOST_WARNING_FLAGS,
-                "nvcc": NVCC_WARNING_FLAGS,
+                "cxx": [*HOST_WARNING_FLAGS, *system_include_flags],
+                "nvcc": [*NVCC_WARNING_FLAGS, *system_include_flags],
             },
         )
 

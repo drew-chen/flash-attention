@@ -10,6 +10,7 @@ import flash_attention_v2
 import flash_attention_v3
 import flash_attention_v4
 import flash_attention_v4_fp16
+import flash_attention_v5
 from src.baseline import forward as baseline_forward
 
 BATCH_SIZE = 4
@@ -33,6 +34,7 @@ IMPLEMENTATIONS = {
     "v3": flash_attention_v3.forward_unchecked,
     "v4": flash_attention_v4.forward_unchecked,
     "v4-fp16": flash_attention_v4_fp16.forward_unchecked,
+    "v5": flash_attention_v5.forward_unchecked,
 }
 
 
@@ -104,7 +106,7 @@ def main():
 
     for seq_len in args.seq_lens:
         for version, forward in implementations:
-            dtype = torch.float16 if version == "v4-fp16" else torch.float32
+            dtype = torch.float16 if version in ("v4-fp16", "v5") else torch.float32
             q, k, v = make_inputs(
                 seq_len,
                 batch_size=args.batch_size,

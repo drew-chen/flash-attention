@@ -1,23 +1,18 @@
 #include "../cuda_utils.h"
+#include <array>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <limits>
+#include <mma.h>
 
 /*
-My next steps involve experimenting with tensor cores. As tensor cores are
-optimized for fp16 (relative to the higher accuracy tf32) and fp16 storage
-reduces memory bandwidth by half, it is naturally to update the input
-Q, K and V to fp16 and keep accumulation to fp32 to maintain precision relative
-to v4. As a fair baseline
-for future tensor core performance, my existing v4 will be adapted to
-use fp16 inputs and fp32 accumulation.
+Uses the WMMA API to use tensor cores to multiply Q @ K^T and P @ V.
 
-flash_forward_v4_fp16_cuda_launch expects raw pointers for tensors shaped as:
+flash_forward_v5_cuda_launch expects raw pointers for tensors shaped as:
 
 - q: [B, H, M, D]
 - k: [B, H, N, D]
@@ -36,38 +31,12 @@ Dimensions:
 - (kv_seq_len) N: number of key/value rows. Self-attention uses M = N, while
   cross-attention may use different lengths.
 - (head_dim) D: head dimension. Size of the per-token vector inside one head.
-
-V4 FP16 implementation:
-
-V4 FP16 uses the same D=64 FA2-style algorithm and warp ownership as V3 and V4.
-V3's Algorithm section is the canonical ownership and distribution reference.
-The algorithm to choose between fp16 and fp32 is simple. Inputs to
-matrix multiplications should aim to be fp16, which uses less global and shared
-memory and gets them ready for tensor cores. If a value may exceed max(fp16) =
-65,504, it should be fp32. Values built from many accumulations or reductions
-should also be fp32, since fp16 rounding error can add up even when the final
-value fits in fp16.
-
-This makes Q, K, V, and the copy of P used by the matrix multiplication fp16.
-The QK scores, softmax state m and l, and output accumulators stay fp32. P is an
-interesting case because its unnormalized value is
-
-    p_ij = exp(s_ij - m_i_new).
-
-Safe softmax subtracts the updated row maximum, so m_i_new >= s_ij and the
-exponent is always zero or negative. exp(0) is 1, while exp of a negative value
-is a positive fraction below 1. This means 0 < p_ij <= 1 for valid entries
-(masked entries use zero). Even though P has not been normalized by l yet, it
-cannot overflow fp16. Very small probabilities can still round or underflow,
-so I compute exp and the l reduction in fp32, then store a rounded fp16 copy of
-P for the PV matrix multiplication.
-
-PV accumulates into fp32 output registers. At the end I normalize by l in fp32
-and round once to fp16 when writing the final output.
 */
 
 namespace flash_attention {
 namespace {
+
+namespace wmma = nvcuda::wmma;
 
 constexpr int B_r = 64;
 constexpr int B_c = 32;
@@ -76,15 +45,21 @@ constexpr int WARP_SIZE = 32;
 constexpr int HEAD_DIM = 64;
 // C++20's std::sqrt is not constexpr, so spell out 1 / sqrt(64).
 constexpr float SOFTMAX_SCALE = 1.0F / 8.0F;
-// Offset consecutive K rows by one shared-memory bank width.
-constexpr int K_SHARED_STRIDE = HEAD_DIM + 2;
+// Shift consecutive K rows by four shared-memory banks.
+constexpr int K_SHARED_STRIDE = HEAD_DIM + 8;
 constexpr int THREAD_BLOCK_SZ = 256;
 constexpr int NUM_WARPS = THREAD_BLOCK_SZ / WARP_SIZE;
 constexpr int WARP_TILE_ROWS = B_r / NUM_WARPS;
-static_assert(HEAD_DIM == 64, "V4 FP16 is specialized for D=64");
+
+// Defines WMMA size to use
+constexpr int WMMA_M = WARP_TILE_ROWS;
+constexpr int WMMA_N = B_c;
+constexpr int WMMA_K = 16;
+
+static_assert(HEAD_DIM == 64, "V5 is specialized for D=64");
 static_assert(THREAD_BLOCK_SZ % WARP_SIZE == 0,
-              "V4 FP16 thread block size must contain a whole number of warps");
-static_assert(B_r % NUM_WARPS == 0, "V4 FP16 Q rows must divide evenly among warps");
+              "V5 thread block size must contain a whole number of warps");
+static_assert(B_r % NUM_WARPS == 0, "V5 Q rows must divide evenly among warps");
 
 enum class ReductionOp : std::uint8_t { SUM, MAX };
 
@@ -99,18 +74,22 @@ struct TileParams {
         sQ_offset + (static_cast<std::size_t>(B_r) * HEAD_DIM);
     static constexpr std::size_t sP_offset =
         sKV_shared_offset + (static_cast<std::size_t>(B_c) * K_SHARED_STRIDE);
-    static constexpr std::size_t total_elements = sP_offset + (static_cast<std::size_t>(B_r) * B_c);
-    static constexpr std::size_t total_bytes = total_elements * sizeof(half);
+    static constexpr std::size_t sS_offset_bytes =
+        (sP_offset + (static_cast<std::size_t>(B_r) * B_c)) * sizeof(half);
+    static constexpr std::size_t sS_elements = static_cast<std::size_t>(B_r) * B_c;
+    static constexpr std::size_t total_bytes = sS_offset_bytes + (sS_elements * sizeof(float));
 };
+static_assert(TileParams::sS_offset_bytes % 32 == 0,
+              "The WMMA score store must be aligned to 32 bytes");
 
 struct FlashForwardKernelParams {
     const half *const gQ; // [B, H, M, 64] Global memory query pointer.
     const half *const gK; // [B, H, N, 64] Global memory key pointer.
     const half *const gV; // [B, H, N, 64] Global memory value pointer.
     half *const gO;       // [B, H, M, 64] Global memory output pointer.
-    const int H;           // Number of heads.
-    const int M;           // Query sequence length.
-    const int N;           // K/V sequence length.
+    const int H;          // Number of heads.
+    const int M;          // Query sequence length.
+    const int N;          // K/V sequence length.
 };
 
 // "Global memory instructions support reading or writing words of
@@ -154,7 +133,7 @@ __device__ void load_shared_tile_vectorized(half *const smem_ptr,
                                             const int tile_rows,
                                             const int tile_i,
                                             const int s_row_stride) {
-    static_assert(HEAD_DIM == 64, "V4 FP16 vectorized tile loads assume D=64");
+    static_assert(HEAD_DIM == 64, "V5 vectorized tile loads assume D=64");
     constexpr int VECTOR_WIDTH = 8;
     constexpr int VECTORS_PER_ROW = HEAD_DIM / VECTOR_WIDTH;
     const int vector_tile_size = tile_rows * VECTORS_PER_ROW;
@@ -189,9 +168,9 @@ __device__ half *load_Q_i(const FlashForwardKernelParams &p,
 
 /**
  * Loads K_j from K [B, H, N, D] into shared memory with padded K rows.
- * The two half-precision padding elements per row avoid bank conflicts when
+ * The eight half-precision padding elements per row reduce bank conflicts when
  * warp lanes read one K column during QK. V later reuses this allocation with
- * its normal [B_c, D] row-major layout.
+ * the same padded [B_c, D] row-major layout.
  */
 __device__ half *load_K_j(const FlashForwardKernelParams &p,
                           half *const smem_ptr,
@@ -206,7 +185,7 @@ __device__ half *load_V_j(const FlashForwardKernelParams &p,
                           half *const smem_ptr,
                           const int tile_j) {
     half *const sV_j = smem_ptr + TileParams::sKV_shared_offset;
-    load_shared_tile_vectorized(sV_j, p.gV, p.H, p.N, B_c, tile_j, HEAD_DIM);
+    load_shared_tile_vectorized(sV_j, p.gV, p.H, p.N, B_c, tile_j, K_SHARED_STRIDE);
     return sV_j;
 }
 
@@ -239,33 +218,66 @@ template <ReductionOp Op> __device__ __forceinline__ float warp_allreduce(float 
 /**
  * Calculates the current Q/K tile's scores for this warp.
  *
- * The warp logically computes
+ * The warp computes
  *
  *     S_ij[row_start : row_start + WARP_TILE_ROWS, :]
  *         = sQ_i[row_start : row_start + WARP_TILE_ROWS, :] @ sK_j^T
  *
  * with shape [WARP_TILE_ROWS, D] @ [D, B_c] = [WARP_TILE_ROWS, B_c].
- * Returns wS_ij which contains S_ij[:, lane].
+ *                      ([8, 64] @ [64, 32]  = [8, 32])
+ *
+ * Performs the matmul with WMMA into sS_ij then returns wS_ij which
+ * contains sS_ij[:, lane] so the rest of the algorithm can continue with the
+ * warp-owned model.
  */
-__device__ __forceinline__ std::array<float, WARP_TILE_ROWS>
-score_ij(const half *const sQ_i,
-         const half *const sK_j,
-         const int row_start,
-         const int lane,
-         const bool key_valid) {
+__device__ __forceinline__ std::array<float, WARP_TILE_ROWS> score_ij(const half *const sQ_i,
+                                                                      const half *const sK_j,
+                                                                      float *const sS_ij,
+                                                                      const int row_start,
+                                                                      const int lane) {
+    static_assert(WMMA_M == WARP_TILE_ROWS);
+    static_assert(WMMA_N == B_c);
     std::array<float, WARP_TILE_ROWS> wS_ij{};
-    if (!key_valid) {
-        return wS_ij;
+    constexpr int lda = HEAD_DIM;
+    constexpr int ldb = K_SHARED_STRIDE;
+    constexpr int ldacc = B_c;
+    static_assert(lda % 8 == 0, "WMMA half-precision lda must be a multiple of 8");
+    static_assert(ldb % 8 == 0, "WMMA half-precision ldb must be a multiple of 8");
+    static_assert(ldacc % 4 == 0, "WMMA float accumulator stride must be a multiple of 4");
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
+    wmma::fill_fragment(acc_frag, 0.0F);
+
+    // WMMA_M and N match the desired output shape exactly
+    // Unfortunately with D = 64 and WMMA_K = 16 we will need to accumulate multiple
+    // matmuls (same idea as a tiled matmul).
+    //   Desired: [8, 64] @ [64, 32]
+    //   WMMA:    [8, 16] @ [16, 32]
+    for (int d = 0; d < HEAD_DIM; d += WMMA_K) {
+        // Load the inputs
+        wmma::load_matrix_sync(a_frag, sQ_i + (static_cast<ptrdiff_t>(row_start * HEAD_DIM)) + d,
+                               lda);
+        wmma::load_matrix_sync(b_frag, sK_j + d, ldb);
+        // Perform the matrix multiplication
+        wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
     }
 
-    for (int d = 0; d < HEAD_DIM; ++d) {
-        const float key = __half2float(sK_j[(lane * K_SHARED_STRIDE) + d]);
-        for (int warp_row = 0; warp_row < WARP_TILE_ROWS; ++warp_row) {
-            const int row = row_start + warp_row;
-            const float query = __half2float(sQ_i[(row * HEAD_DIM) + d]);
-            wS_ij[static_cast<std::size_t>(warp_row)] += query * key;
-        }
+    // Store the warp's [8, 32] output. We only need one store since acc_frag
+    // is the shape we want already.
+    // Since the threadblock is 1d, we can simply partition sS by
+    // the threadIdx's mapping to warp #
+    const std::size_t warp = threadIdx.x / WARP_SIZE;
+    constexpr std::size_t WARP_SCORE_ELEMENTS = static_cast<std::size_t>(WARP_TILE_ROWS) * B_c;
+    float *const warp_sS_ij = sS_ij + (warp * WARP_SCORE_ELEMENTS);
+    wmma::store_matrix_sync(warp_sS_ij, acc_frag, ldacc, wmma::mem_row_major);
+    __syncwarp(FULL_WARP_MASK);
+
+#pragma unroll
+    for (int warp_row = 0; warp_row < WARP_TILE_ROWS; ++warp_row) {
+        wS_ij[static_cast<std::size_t>(warp_row)] = warp_sS_ij[(warp_row * B_c) + lane];
     }
+
     return wS_ij;
 }
 
@@ -282,7 +294,8 @@ __device__ __forceinline__ void online_softmax_ij(half *const sP_ij_unnormalized
                                                   float (&wM_i_replicated)[WARP_TILE_ROWS],
                                                   float (&wL_i_replicated)[WARP_TILE_ROWS],
                                                   float (&wO_i_left_unnormalized)[WARP_TILE_ROWS],
-                                                  float (&wO_i_right_unnormalized)[WARP_TILE_ROWS]) {
+                                                  float (&wO_i_right_unnormalized)
+                                                      [WARP_TILE_ROWS]) {
     for (int warp_row = 0; warp_row < WARP_TILE_ROWS; ++warp_row) {
         const int row = row_start + warp_row;
         const bool query_valid = query_start + row < M;
@@ -293,14 +306,12 @@ __device__ __forceinline__ void online_softmax_ij(half *const sP_ij_unnormalized
         // Each lane contributes its score against sK_j[lane, :] for this owned
         // Q row. The reductions broadcast the row result back to every lane.
         const float key_tile_row_max = warp_allreduce<ReductionOp::MAX>(score);
-        const float m_new =
-            query_valid ? fmaxf(wM_i_replicated[warp_row], key_tile_row_max) : 0.0F;
+        const float m_new = query_valid ? fmaxf(wM_i_replicated[warp_row], key_tile_row_max) : 0.0F;
         const float p_value = query_valid && key_valid ? expf(score - m_new) : 0.0F;
         const float key_tile_row_sum = warp_allreduce<ReductionOp::SUM>(p_value);
         const float old_scale = query_valid ? expf(wM_i_replicated[warp_row] - m_new) : 0.0F;
 
-        wL_i_replicated[warp_row] =
-            (old_scale * wL_i_replicated[warp_row]) + key_tile_row_sum;
+        wL_i_replicated[warp_row] = (old_scale * wL_i_replicated[warp_row]) + key_tile_row_sum;
         wO_i_left_unnormalized[warp_row] *= old_scale;
         wO_i_right_unnormalized[warp_row] *= old_scale;
         wM_i_replicated[warp_row] = m_new;
@@ -317,22 +328,67 @@ __device__ __forceinline__ void online_softmax_ij(half *const sP_ij_unnormalized
  *
  * with shape [WARP_TILE_ROWS, B_c] @ [B_c, D] = [WARP_TILE_ROWS, D].
  */
-__device__ __forceinline__ void accumulate_PV_into_O_i(
-    const half *const sP_ij_unnormalized,
-    const half *const sV_j,
-    const int row_start,
-    const int lane,
-    float (&wO_i_left_unnormalized)[WARP_TILE_ROWS],
-    float (&wO_i_right_unnormalized)[WARP_TILE_ROWS]) {
-    for (int key_row = 0; key_row < B_c; ++key_row) {
-        const float value_left = __half2float(sV_j[(key_row * HEAD_DIM) + lane]);
-        const float value_right =
-            __half2float(sV_j[(key_row * HEAD_DIM) + lane + WARP_SIZE]);
+__device__ __forceinline__ void accumulate_PV_into_O_i(const half *const sP_ij_unnormalized,
+                                                       const half *const sV_j,
+                                                       float *const sS_ij,
+                                                       const int row_start,
+                                                       const int lane,
+                                                       float (&wO_i_left_unnormalized)
+                                                           [WARP_TILE_ROWS],
+                                                       float (&wO_i_right_unnormalized)
+                                                           [WARP_TILE_ROWS]) {
+    static_assert(WMMA_M == WARP_TILE_ROWS);
+    static_assert(WMMA_N == WARP_SIZE);
+    static_assert(B_c % WMMA_K == 0);
+    static_assert(HEAD_DIM % WMMA_N == 0);
+    constexpr int ldp = B_c;
+    constexpr int ldv = K_SHARED_STRIDE;
+    constexpr int ldacc = WMMA_N;
+    static_assert(ldp % 8 == 0, "WMMA half-precision ldp must be a multiple of 8");
+    static_assert(ldv % 8 == 0, "WMMA half-precision ldv must be a multiple of 8");
+    static_assert(ldacc % 4 == 0, "WMMA float accumulator stride must be a multiple of 4");
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> p_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> v_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
+
+    const std::size_t warp = threadIdx.x / WARP_SIZE;
+    constexpr std::size_t WARP_OUTPUT_ELEMENTS = static_cast<std::size_t>(WARP_TILE_ROWS) * WMMA_N;
+    float *const warp_sPV_ij = sS_ij + (warp * WARP_OUTPUT_ELEMENTS);
+
+    // WMMA_M matches the eight warp-owned rows, but WMMA_N covers only half of D.
+    //   Desired: [8, 32] @ [32, 64]
+    //   WMMA:    [8, 16] @ [16, 32]
+    // Therefore output_col selects the left or right [8, 32] output tile, while
+    // key_col performs the two K=16 matmuls needed to reduce across B_c=32.
+    for (int output_col = 0; output_col < HEAD_DIM; output_col += WMMA_N) {
+        // Start a new [8, 32] output tile at zero before accumulating across B_c.
+        wmma::fill_fragment(acc_frag, 0.0F);
+
+        for (int key_col = 0; key_col < B_c; key_col += WMMA_K) {
+            // Load P[row_start : row_start + 8, key_col : key_col + 16].
+            wmma::load_matrix_sync(p_frag,
+                                   sP_ij_unnormalized + (static_cast<ptrdiff_t>(row_start * B_c)) +
+                                       key_col,
+                                   ldp);
+            // Load V[key_col : key_col + 16, output_col : output_col + 32].
+            wmma::load_matrix_sync(v_frag, sV_j + (key_col * K_SHARED_STRIDE) + output_col, ldv);
+            // acc_frag += p_frag @ v_frag.
+            wmma::mma_sync(acc_frag, p_frag, v_frag, acc_frag);
+        }
+
+        // WMMA fragment elements have an opaque lane mapping, so materialize the
+        // warp's [8, 32] result in shared memory before assigning columns to lanes.
+        wmma::store_matrix_sync(warp_sPV_ij, acc_frag, ldacc, wmma::mem_row_major);
+        __syncwarp(FULL_WARP_MASK);
+
         for (int warp_row = 0; warp_row < WARP_TILE_ROWS; ++warp_row) {
-            const int row = row_start + warp_row;
-            const float p_value = __half2float(sP_ij_unnormalized[(row * B_c) + key_row]);
-            wO_i_left_unnormalized[warp_row] += p_value * value_left;
-            wO_i_right_unnormalized[warp_row] += p_value * value_right;
+            // Lane l owns column l of this output tile for every warp-owned row.
+            const float contribution = warp_sPV_ij[(warp_row * WMMA_N) + lane];
+            if (output_col == 0) {
+                wO_i_left_unnormalized[warp_row] += contribution;
+            } else {
+                wO_i_right_unnormalized[warp_row] += contribution;
+            }
         }
     }
 }
@@ -359,10 +415,10 @@ __device__ __forceinline__ void normalize_and_save_O_i(const FlashForwardKernelP
         if (global_row < p.M) {
             const std::size_t output_row_offset =
                 output_head_offset + (static_cast<std::size_t>(global_row) * HEAD_DIM);
-            p.gO[output_row_offset + lane_offset] = __float2half_rn(
-                wO_i_left_unnormalized[warp_row] / wL_i_replicated[warp_row]);
-            p.gO[output_row_offset + lane_offset + WARP_SIZE] = __float2half_rn(
-                wO_i_right_unnormalized[warp_row] / wL_i_replicated[warp_row]);
+            p.gO[output_row_offset + lane_offset] =
+                __float2half_rn(wO_i_left_unnormalized[warp_row] / wL_i_replicated[warp_row]);
+            p.gO[output_row_offset + lane_offset + WARP_SIZE] =
+                __float2half_rn(wO_i_right_unnormalized[warp_row] / wL_i_replicated[warp_row]);
         }
     }
 }
@@ -373,14 +429,16 @@ __device__ __forceinline__ void normalize_and_save_O_i(const FlashForwardKernelP
  * For every Q row owned by a warp, each lane computes one score. Lane 0 uses
  * K row 0 within the current block, lane 1 uses K row 1, and so on. Each lane
  * also accumulates two output dimensions. Running softmax state and output
- * accumulators stay in registers. Shared memory contains Q and P. K and V use
- * separate names for the same shared storage because their lifetimes do not
- * overlap.
+ * accumulators stay in registers. Shared memory contains Q, P, and S. K and V
+ * use separate names for the same shared storage because their lifetimes do
+ * not overlap.
  */
 __global__ void forward_d64(FlashForwardKernelParams p) {
-    extern __shared__ half smem[];
+    extern __shared__ __align__(32) unsigned char smem_raw[];
+    auto *const smem = reinterpret_cast<half *>(smem_raw);
 
     half *const sP_ij_unnormalized = smem + TileParams::sP_offset;
+    float *const sS_ij = reinterpret_cast<float *>(smem_raw + TileParams::sS_offset_bytes);
 
     const int warp = static_cast<int>(threadIdx.x) / WARP_SIZE;
     const int lane = static_cast<int>(threadIdx.x) % WARP_SIZE;
@@ -418,8 +476,7 @@ __global__ void forward_d64(FlashForwardKernelParams p) {
         const bool key_valid = (key_tile * B_c) + lane < p.N;
         // For every Q row owned by this warp, wS_ij stores this lane's score
         // against sK_j[lane, :].
-        auto wS_ij =
-            score_ij(sQ_i, sK_j, row_start, lane, key_valid);
+        auto wS_ij = score_ij(sQ_i, sK_j, sS_ij, row_start, lane);
         online_softmax_ij(sP_ij_unnormalized, p.M, query_start, row_start, lane, key_valid, wS_ij,
                           wM_i_replicated, wL_i_replicated, wO_i_left_unnormalized,
                           wO_i_right_unnormalized);
@@ -429,7 +486,7 @@ __global__ void forward_d64(FlashForwardKernelParams p) {
         half *const sV_j = load_V_j(p, smem, key_tile);
         __syncthreads();
 
-        accumulate_PV_into_O_i(sP_ij_unnormalized, sV_j, row_start, lane,
+        accumulate_PV_into_O_i(sP_ij_unnormalized, sV_j, sS_ij, row_start, lane,
                                wO_i_left_unnormalized, wO_i_right_unnormalized);
         // Finish reading sV_j before the next sK_j reuses its shared storage.
         __syncthreads();
@@ -445,16 +502,16 @@ __global__ void forward_d64(FlashForwardKernelParams p) {
  * Configures and launches the tiled attention kernel. The kernel keeps its
  * running softmax state in registers.
  */
-void flash_forward_v4_fp16_cuda_launch(const c10::Half *const gQ,
-                                    const c10::Half *const gK,
-                                    const c10::Half *const gV,
-                                    c10::Half *const gO,
-                                    int B,
-                                    int H,
-                                    int M,
-                                    int N,
-                                    int D) {
-    TORCH_CHECK(D == static_cast<int>(HEAD_DIM), "V4 FP16 CUDA kernel supports only D=64");
+void flash_forward_v5_cuda_launch(const c10::Half *const gQ,
+                                  const c10::Half *const gK,
+                                  const c10::Half *const gV,
+                                  c10::Half *const gO,
+                                  int B,
+                                  int H,
+                                  int M,
+                                  int N,
+                                  int D) {
+    TORCH_CHECK(D == static_cast<int>(HEAD_DIM), "V5 CUDA kernel supports only D=64");
 
     // c10::Half is PyTorch's portable fp16 type while half is CUDA-specific.
     // Their pointer types are unrelated, so the shared fp16 representation is
@@ -475,7 +532,7 @@ void flash_forward_v4_fp16_cuda_launch(const c10::Half *const gQ,
               static_cast<unsigned int>(query_tiles)};
 
     // Prefer the largest shared-memory carveout to maximize residency for the
-    // 16.125 KiB half-precision tile allocation.
+    // 24 KiB mixed-precision tile allocation.
     C10_CUDA_CHECK(cudaFuncSetAttribute(forward_d64, cudaFuncAttributePreferredSharedMemoryCarveout,
                                         cudaSharedmemCarveoutMaxShared));
 
