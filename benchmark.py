@@ -18,7 +18,7 @@ NUM_HEADS = 12
 HEAD_DIM = 64
 SEQ_LENS = (512, 1024, 2048)
 WARMUP = 25
-REPETITIONS = 100
+REPETITIONS = 50
 
 
 def sdpa_forward(q, k, v):
@@ -28,6 +28,7 @@ def sdpa_forward(q, k, v):
 IMPLEMENTATIONS = {
     "baseline": baseline_forward,
     "sdpa": sdpa_forward,
+    "sdpa-fp16": sdpa_forward,
     "v0": flash_attention_v0.forward_unchecked,
     "v1": flash_attention_v1.forward_unchecked,
     "v2": flash_attention_v2.forward_unchecked,
@@ -36,6 +37,7 @@ IMPLEMENTATIONS = {
     "v4-fp16": flash_attention_v4_fp16.forward_unchecked,
     "v5": flash_attention_v5.forward_unchecked,
 }
+FP16_IMPLEMENTATIONS = ("sdpa-fp16", "v4-fp16", "v5")
 
 
 def make_inputs(
@@ -106,7 +108,7 @@ def main():
 
     for seq_len in args.seq_lens:
         for version, forward in implementations:
-            dtype = torch.float16 if version in ("v4-fp16", "v5") else torch.float32
+            dtype = torch.float16 if version in FP16_IMPLEMENTATIONS else torch.float32
             q, k, v = make_inputs(
                 seq_len,
                 batch_size=args.batch_size,

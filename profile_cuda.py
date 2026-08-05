@@ -9,7 +9,7 @@ import argparse
 
 import torch
 
-from benchmark import IMPLEMENTATIONS, make_inputs
+from benchmark import FP16_IMPLEMENTATIONS, IMPLEMENTATIONS, make_inputs
 
 SEQ_LEN = 2048
 FUSED_IMPLEMENTATIONS = ("v1", "v2", "v3", "v4", "v4-fp16", "v5")
@@ -21,7 +21,7 @@ def main():
     implementation = parser.parse_args().implementation
 
     forward = IMPLEMENTATIONS[implementation]
-    dtype = torch.float16 if implementation in ("v4-fp16", "v5") else torch.float32
+    dtype = torch.float16 if implementation in FP16_IMPLEMENTATIONS else torch.float32
     q, k, v = make_inputs(SEQ_LEN, dtype=dtype)
 
     # Warm up before entering the range selected by the profiler.

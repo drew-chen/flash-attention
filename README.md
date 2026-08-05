@@ -19,9 +19,8 @@ out = flash_attention_v5.forward(q, k, v)
 ## Results
 
 Primary shape: `B=4, H=12, M=N=2048, D=64` (all implementations are non-causal).
-Results through V4 were measured with 5 warmups and 10 repetitions. V4 FP16
-and V5 use FP16 inputs and outputs; their measurements use 25 warmups and 100
-timed calls.
+Every latency in the implementation table uses the same benchmark protocol: 25
+warmups followed by 50 timed calls.
 
 ### Roofline
 
@@ -40,24 +39,27 @@ reported separately below.
 
 | Version | Title | Dtype | Latency (µs) | Δ vs. baseline | Description |
 | --- | --- | --- | ---: | ---: | --- |
-| Baseline | Naive PyTorch | FP32 | 11940.15 | — | Explicit PyTorch attention used as the correctness and latency reference |
-| SDPA | PyTorch SDPA | FP32 | 5507.07 | −53.9% | Optimized PyTorch reference with automatic CUDA backend selection |
-| V0 | Naive CUDA | FP32 | 41232.39 | +245.3% | Unfused CUDA kernels that materialize the attention matrix |
-| V1 | FlashAttention-1 | FP32 | 241906.59 | +1926.0% | Fused tiled online softmax with one block per batch and head |
-| V2 | Simplified FlashAttention-2 | FP32 | 128997.28 | +980.4% | FA2-style query-tile parallelism, but most state still lives in shared memory |
-| V3 | Warp-local FlashAttention-2 | FP32 | 7790.91 | −34.8% | V3 with warp-owned softmax/output state, register-blocked QK and PV, and reused K/V shared storage |
-| V4 | Optimized V3 | FP32 | 3810.30 | −68.1% | V3 with vectorized copies, forced inlining, padded shared K rows, and selective 32-bit indexing |
-| V4 FP16 | FP16 storage baseline | FP16 | 4115.77 | −65.5% | V4's scalar matmuls with FP16 storage and FP32 accumulation |
-| V5 | Tensor-core WMMA | FP16 | 2270.25 | −81.0% | WMMA QK and PV with FP32 accumulation and padded FP16 K/V shared rows |
+| Baseline | Naive PyTorch | FP32 | 9566.19 | — | Explicit PyTorch attention used as the correctness and latency reference |
+| SDPA | PyTorch SDPA | FP32 | 4133.99 | −56.8% | Optimized PyTorch reference with automatic CUDA backend selection |
+| SDPA FP16 | PyTorch SDPA | FP16 | 620.32 | −93.5% | Dtype-matched PyTorch reference with automatic CUDA backend selection |
+| V0 | Naive CUDA | FP32 | 35748.39 | +273.7% | Unfused CUDA kernels that materialize the attention matrix |
+| V1 | FlashAttention-1 | FP32 | 191148.32 | +1898.2% | Fused tiled online softmax with one block per batch and head |
+| V2 | Simplified FlashAttention-2 | FP32 | 107191.30 | +1020.5% | FA2-style query-tile parallelism, but most state still lives in shared memory |
+| V3 | Warp-local FlashAttention-2 | FP32 | 6476.57 | −32.3% | V3 with warp-owned softmax/output state, register-blocked QK and PV, and reused K/V shared storage |
+| V4 | Optimized V3 | FP32 | 4111.20 | −57.0% | V3 with vectorized copies, forced inlining, padded shared K rows, and selective 32-bit indexing |
+| V4 FP16 | FP16 storage baseline | FP16 | 4514.22 | −52.8% | V4's scalar matmuls with FP16 storage and FP32 accumulation |
+| V5 | Tensor-core WMMA | FP16 | 2240.18 | −76.6% | WMMA QK and PV with FP32 accumulation and padded FP16 K/V shared rows |
 
 At `M=N=2048`, V5 is the fastest project implementation in this table. It was
-1,845.52 µs, or 44.8%, faster than the same-dtype V4 FP16 storage baseline. V5
-was also 3,236.82 µs, or 58.8%, faster than FP32 SDPA, although that comparison
-is not dtype-matched.
+2,274.04 µs, or 50.4%, faster than the same-dtype V4 FP16 storage baseline. V5
+was 1,893.81 µs, or 45.8%, faster than FP32 SDPA. The dtype-matched FP16 SDPA
+reference was fastest overall at 620.32 µs, 1,619.86 µs, or 72.3%, faster than
+V5.
 
 
 V0–V4 accept contiguous CUDA `float32` tensors. V4 FP16 and V5 accept and return
-`float16`. V0 requires self-attention with `M = N`. V1–V5, including V4 FP16,
+`float16`. The benchmark's FP16 SDPA reference also uses `float16`. V0 requires
+self-attention with `M = N`. V1–V5, including V4 FP16,
 accept Q `[B, H, M, D]` and K/V `[B, H, N, D]`. V3 and V4 specialize their CUDA
 kernels for `D=64` and redirect other head dimensions to V2. V4 FP16 and V5
 support only `D=64` and reject unsupported inputs rather than falling back.
@@ -196,11 +198,15 @@ Profiling
 | Shared-store bank-conflict ratio | 29.38% | 1.9-way average across store requests |
 
 V4 keeps the same algorithm and warp mapping as V3. It just adds a few
-lower-level CUDA optimizations. Together, they cut latency from 7,790.91 µs to
-3,810.30 µs, which saves 3,980.61 µs or 51.1%.
+lower-level CUDA optimizations. Under the standardized benchmark, they cut
+latency from 6,476.57 µs to 4,111.20 µs, which saves 2,365.37 µs or 36.5%.
 
 The profiled duration was collected under Nsight Compute and is distinct from
 the standalone timing benchmark.
+
+The step-by-step measurements below were recorded during V4 development before
+the benchmark protocol was standardized. They show the effect of each change
+within that tuning run and should not be compared directly with the main table.
 
 Trying to force every loop to unroll made things worse. Register use went from
 80 to 91 per thread, so only two blocks could fit on each SM instead of three.
@@ -249,7 +255,7 @@ rounding. Max error captures the worst element, mean error captures typical
 error, RMSE weights larger errors more, and relative L2 normalizes total error
 by the reference magnitude. These are measurements, not error bounds.
 
-V4 FP16 took 4,115.77 µs versus V4's 3,770.62 µs, so it was 9.2% slower.
+V4 FP16 took 4,514.22 µs versus V4's 4,111.20 µs, so it was 9.8% slower.
 V4 is already compute-bound, and V4 FP16 still performs scalar FP32 `FFMA`s
 after converting FP16 operands inside QK and PV. The smaller shared allocation
 does not improve residency: 72 registers per thread still limit both versions
@@ -269,7 +275,7 @@ cuobjdump --dump-sass flash_attention_v4_fp16*.so \
 Profiling
 | Metric | Value | Interpretation |
 | --- | ---: | --- |
-| Latency | 2270.25 µs | Median of five samples; 25 warmups and 100 calls each |
+| Latency | 2240.18 µs | 25 warmups followed by 50 timed calls |
 | Profiled duration | 2.30 ms | Nsight Compute measurement |
 | Tensor-pipe active cycles | 11.51% | Both QK and PV execute on tensor cores |
 | Occupancy | 48.14% achieved | 50.00% theoretical |
@@ -374,7 +380,7 @@ python accuracy.py v5 \
 
 ### Benchmarks
 
-The fixed suite measures `M=N=512, 1024, 2048` at `B=4, H=12, D=64`, using 25 warmups and 100
+The fixed suite measures `M=N=512, 1024, 2048` at `B=4, H=12, D=64`, using 25 warmups and 50
 timed calls.
 
 Benchmark every registered implementation:
@@ -389,8 +395,14 @@ Or benchmark one implementation:
 python benchmark.py v5
 ```
 
-The required implementation argument accepts `all`, `baseline`, `sdpa`, and
-`v0` through `v5`, plus `v4-fp16`.
+Benchmark the dtype-matched FP16 PyTorch reference with:
+
+```bash
+python benchmark.py sdpa-fp16
+```
+
+The required implementation argument accepts `all`, `baseline`, `sdpa`,
+`sdpa-fp16`, and `v0` through `v5`, plus `v4-fp16`.
 
 The shape and timing counts can be overridden for larger, shorter benchmark runs:
 
@@ -408,7 +420,8 @@ python benchmark.py v5 \
 
 Profiling commands cover the project's fused implementations. Baseline and V0
 launch multiple kernels, so a single roofline or occupancy value would be
-ambiguous. SDPA is handled inside PyTorch and is not profiled here.
+ambiguous. The SDPA baselines are handled inside PyTorch and are not profiled
+here.
 
 `profile.sh` uses Nsight Compute's `detailed` set by default and adds scheduler,
 warp-state, and detailed memory-workload sections. The resulting report includes
@@ -425,9 +438,9 @@ Or profile every registered fused implementation:
 ./profile.sh all
 ```
 
-`all` skips baseline, SDPA, and V0. Passing one of them directly is an error. If
-non-admin GPU performance counters are disabled, run the script with `sudo`.
-It uses the repository's virtual environment by absolute path.
+`all` skips baseline, both SDPA baselines, and V0. Passing one of them directly
+is an error. If non-admin GPU performance counters are disabled, run the script
+with `sudo`. It uses the repository's virtual environment by absolute path.
 
 Use a different Nsight Compute section set when needed:
 
