@@ -1,0 +1,83 @@
+{
+  "shape": {
+    "batch": 4,
+    "heads": 12,
+    "m": 2048,
+    "n": 2048,
+    "d": 64
+  },
+  "algorithmic_attention_flops": 51539607552,
+  "application_roofline": {
+    "definition": "algorithmic QK+PV FLOPs divided by complete-call duration and measured DRAM traffic",
+    "hardware_limits": {
+      "fp32_peak_tflop_per_s": 48.644964717096954,
+      "fp16_tensor_peak_tflop_per_s": 97.28992943419391,
+      "dram_peak_gb_per_s": 690.6209243296
+    },
+    "points": {
+      "baseline": {
+        "arithmetic_intensity_flop_per_byte": 10.23914642532394,
+        "performance_tflop_per_s": 5.735289721356716,
+        "duration_ms": 8.9864,
+        "dram_bandwidth_gb_per_s": 560.1335778509747,
+        "dram_traffic_gb": 5.033584384
+      },
+      "sdpa": {
+        "arithmetic_intensity_flop_per_byte": 343.66014060380945,
+        "performance_tflop_per_s": 11.033483377290631,
+        "duration_ms": 4.671200000000001,
+        "dram_bandwidth_gb_per_s": 32.105798938174345,
+        "dram_traffic_gb": 0.149972608
+      },
+      "v1": {
+        "arithmetic_intensity_flop_per_byte": 33.13195811903466,
+        "performance_tflop_per_s": 0.2704414554961426,
+        "duration_ms": 190.57584000000003,
+        "dram_bandwidth_gb_per_s": 8.162555757329994,
+        "dram_traffic_gb": 1.55558592
+      },
+      "v2": {
+        "arithmetic_intensity_flop_per_byte": 52.8836753528823,
+        "performance_tflop_per_s": 0.48010877212541386,
+        "duration_ms": 107.349856,
+        "dram_bandwidth_gb_per_s": 9.078581791483725,
+        "dram_traffic_gb": 0.974584448
+      },
+      "v3": {
+        "arithmetic_intensity_flop_per_byte": 384.6753801105342,
+        "performance_tflop_per_s": 7.914403333595407,
+        "duration_ms": 6.512128000000001,
+        "dram_bandwidth_gb_per_s": 20.574239326991112,
+        "dram_traffic_gb": 0.13398208
+      },
+      "v4": {
+        "arithmetic_intensity_flop_per_byte": 336.65303064759945,
+        "performance_tflop_per_s": 12.543615205489052,
+        "duration_ms": 4.1088320000000005,
+        "dram_bandwidth_gb_per_s": 37.25977212015482,
+        "dram_traffic_gb": 0.153094144
+      },
+      "v4-fp16": {
+        "arithmetic_intensity_flop_per_byte": 560.162467394253,
+        "performance_tflop_per_s": 11.380652732437358,
+        "duration_ms": 4.528704,
+        "dram_bandwidth_gb_per_s": 20.316699877050915,
+        "dram_traffic_gb": 0.09200832
+      },
+      "sdpa-fp16": {
+        "arithmetic_intensity_flop_per_byte": 782.7886691434204,
+        "performance_tflop_per_s": 81.58719092244567,
+        "duration_ms": 0.6317119999999999,
+        "dram_bandwidth_gb_per_s": 104.22633098627223,
+        "dram_traffic_gb": 0.065841024
+      },
+      "v5": {
+        "arithmetic_intensity_flop_per_byte": 767.9033324814915,
+        "performance_tflop_per_s": 22.461338465400384,
+        "duration_ms": 2.294592,
+        "dram_bandwidth_gb_per_s": 29.250216160432878,
+        "dram_traffic_gb": 0.067117312
+      }
+    }
+  }
+}

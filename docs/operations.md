@@ -106,72 +106,100 @@ python benchmark.py v5 \
 
 ## Profiling
 
-Profiling commands cover the project's fused implementations. Baseline and V0
-launch multiple kernels, so a single roofline or occupancy value would be
-ambiguous. The SDPA baselines are handled inside PyTorch and are not profiled
-here.
+Use `profile.sh` for detailed inspection of one fused CUDA kernel. Use
+`roofline.py` for the combined application-level comparison, including the
+multi-kernel PyTorch and SDPA references. V0 is excluded from both comparisons
+because it launches multiple project kernels.
 
-`profile.sh` uses Nsight Compute's `detailed` set by default and adds scheduler,
-warp-state, and detailed memory-workload sections. The resulting report includes
-the roofline, occupancy, launch statistics, stalls, and shared-memory conflict
-counters. Profile one fused implementation:
+### Kernel details
+
+Collect one detailed report, or all fused-kernel reports:
 
 ```bash
 ./profile.sh v5
-```
-
-Or profile every registered fused implementation:
-
-```bash
 ./profile.sh all
 ```
 
-`all` skips baseline, both SDPA baselines, and V0. Passing one of them directly
-is an error. If non-admin GPU performance counters are disabled, run the script
-with `sudo`. It uses the repository's virtual environment by absolute path.
-
-Use a different Nsight Compute section set when needed:
+Reports are saved as `/tmp/flash_<implementation>_s2048_profile.ncu-rep`. Set
+the report to inspect, then print its duration, occupancy, registers, and shared
+memory:
 
 ```bash
-./profile.sh v5 --set full
-```
+ncu_bin=/usr/local/cuda/bin/ncu
+report=/tmp/flash_v4-fp16_s2048_profile.ncu-rep
 
-Reports are saved as `/tmp/flash_<implementation>_s2048_profile.ncu-rep`.
-
-Open the report:
-
-```bash
-ncu-ui /tmp/flash_v5_s2048_profile.ncu-rep
-```
-
-Open all six fused-kernel reports:
-
-```bash
-ncu-ui \
-  /tmp/flash_v1_s2048_profile.ncu-rep \
-  /tmp/flash_v2_s2048_profile.ncu-rep \
-  /tmp/flash_v3_s2048_profile.ncu-rep \
-  /tmp/flash_v4_s2048_profile.ncu-rep \
-  /tmp/flash_v4-fp16_s2048_profile.ncu-rep \
-  /tmp/flash_v5_s2048_profile.ncu-rep
-```
-
-Print occupancy and launch statistics:
-
-```bash
-/usr/local/cuda/bin/ncu \
-  --import /tmp/flash_v5_s2048_profile.ncu-rep \
+"$ncu_bin" \
+  --import "$report" \
   --page details \
+  --section SpeedOfLight \
   --section Occupancy \
   --section LaunchStats
 ```
 
-Print the roofline overview:
+Print FP32 operations and DRAM bandwidth:
 
 ```bash
-/usr/local/cuda/bin/ncu \
-  --import /tmp/flash_v5_s2048_profile.ncu-rep \
+"$ncu_bin" \
+  --import "$report" \
   --page details \
   --section SpeedOfLight_RooflineChart \
   --print-details all
 ```
+
+For V5's dense FP16-to-FP32 Tensor Core values, use its report and Tensor Core
+section instead:
+
+```bash
+report=/tmp/flash_v5_s2048_profile.ncu-rep
+
+"$ncu_bin" \
+  --import "$report" \
+  --page details \
+  --section SpeedOfLight_HierarchicalTensorRooflineChart \
+  --print-details all
+```
+
+Print the shared-memory counters:
+
+```bash
+"$ncu_bin" \
+  --import "$report" \
+  --page details \
+  --section MemoryWorkloadAnalysis_Tables \
+  --print-details all
+```
+
+The README uses these calculations:
+
+- `TFLOP/s = operations/cycle × SM GHz ÷ 1000`
+- `FLOP/byte = TFLOP/s × 1000 ÷ DRAM GB/s`
+- `bank-conflict % = 100 × bank conflicts ÷ wavefronts`
+
+For scalar FP32, operations/cycle includes FFMA operations plus FADD and FMUL
+instructions. For V5, use the `fp16` source, `fp32` destination, sparsity-off
+row. Run `ncu-ui "$report"` only when interactive investigation is useful.
+
+Profiling uses input seed 0, flushes caches between replay passes, and locks
+clocks to the supported boost frequency. Pass `--set full` to `profile.sh` only
+when the larger report is needed.
+
+### Application roofline
+
+Collect all required reports and generate `roofline-data.json` and
+`roofline.png`:
+
+```bash
+python roofline.py --profile
+```
+
+Regenerate from existing reports, or refresh only selected implementations:
+
+```bash
+python roofline.py
+python roofline.py --profile --implementations v5
+```
+
+The collector measures only elapsed time and DRAM bytes. Every point uses the
+same algorithmic QK+PV work, while V5's built-in Nsight sections provide the
+FP32, dense FP16 Tensor Core, and DRAM ceilings. Minimal reports are kept
+separately as `/tmp/flash_<implementation>_s2048_roofline.ncu-rep`.

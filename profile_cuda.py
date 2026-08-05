@@ -12,16 +12,27 @@ import torch
 from benchmark import FP16_IMPLEMENTATIONS, IMPLEMENTATIONS, make_inputs
 
 SEQ_LEN = 2048
-FUSED_IMPLEMENTATIONS = ("v1", "v2", "v3", "v4", "v4-fp16", "v5")
+PROFILE_IMPLEMENTATIONS = (
+    "baseline",
+    "sdpa",
+    "sdpa-fp16",
+    "v1",
+    "v2",
+    "v3",
+    "v4",
+    "v4-fp16",
+    "v5",
+)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("implementation", choices=FUSED_IMPLEMENTATIONS)
+    parser.add_argument("implementation", choices=PROFILE_IMPLEMENTATIONS)
     implementation = parser.parse_args().implementation
 
     forward = IMPLEMENTATIONS[implementation]
     dtype = torch.float16 if implementation in FP16_IMPLEMENTATIONS else torch.float32
+    torch.manual_seed(0)
     q, k, v = make_inputs(SEQ_LEN, dtype=dtype)
 
     # Warm up before entering the range selected by the profiler.

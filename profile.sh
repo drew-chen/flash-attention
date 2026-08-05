@@ -55,13 +55,21 @@ cd "$repo_root"
 profile_implementation() {
   local implementation="$1"
   local report="/tmp/flash_${implementation}_s2048_profile"
+  local extra_sections=()
+
+  if [[ "$implementation" == "v5" ]]; then
+    extra_sections+=(--section SpeedOfLight_HierarchicalTensorRooflineChart)
+  fi
 
   echo "Profiling $implementation with Nsight Compute set '$profile_set'..."
   "$ncu_bin" \
     --set "$profile_set" \
+    --cache-control all \
+    --clock-control boost \
     --section SchedulerStats \
     --section WarpStateStats \
     --section MemoryWorkloadAnalysis_Tables \
+    "${extra_sections[@]}" \
     --replay-mode kernel \
     --nvtx \
     --nvtx-include "flash_attention.${implementation}/" \

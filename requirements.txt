@@ -5,3 +5,6 @@ setuptools
 
 # Tests
 pytest
+
+# Roofline chart generation
+matplotlib

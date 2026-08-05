@@ -22,24 +22,24 @@ benchmarks, and Nsight Compute profiling.
 
 ## Results
 
+SDPA means scaled dot-product attention and refers here to PyTorch's
+`torch.nn.functional.scaled_dot_product_attention` implementation.
+
 Primary shape: `B=4, H=12, M=N=2048, D=64` (all implementations are non-causal).
 Every latency in the implementation table uses the same benchmark protocol: 25
 warmups followed by 50 timed calls.
 
 ### Roofline
 
-![Nsight Compute roofline comparison of V1 through V4](roofline-v1-to-v4.png)
+![Roofline comparison of all implementations](roofline.png)
 
-From left to right, each circle represents v1, v2, v3, and v4 (top right).
-
-The combined Nsight Compute roofline shows the FP32 optimization progression
-from V1 through V4. V4, the final FP32 kernel in that progression, is on the
-compute-bound side of the FP32 ridge and reaches 29% of peak FP32 throughput.
-The image predates V4's selective 32-bit indexing optimization and V5. It should
-be read as a historical FP32 comparison; V5's FP16 tensor-core metrics are
-reported separately below.
+Every point uses the same algorithmic work divided by the complete
+attention call's Nsight Compute duration and measured DRAM traffic. V4 FP16
+uses the FP32 ceiling because it has FP16 storage but scalar FP32 arithmetic.
 
 ### Implementations
+
+
 
 | Version | Title | Dtype | Latency (µs) | Δ vs. baseline | Description |
 | --- | --- | --- | ---: | ---: | --- |
@@ -99,21 +99,25 @@ The shared-memory bank-conflict ratios below are the number of bank conflicts
 divided by the total load or store wavefronts. They are not the percentage of
 shared-memory instructions that encounter a conflict.
 
+Compute throughput and arithmetic intensity follow each implementation's actual
+compute path: scalar FP32 for V1 through V4 FP16 and dense FP16 Tensor Core
+operations with FP32 accumulation for V5.
+
 ### V1: FlashAttention-1
 
 Profiling
 | Metric | Value | Interpretation |
 | --- | ---: | --- |
-| Profiled duration | 190.54 ms | — |
-| FP32 throughput | 0.336 TFLOP/s | About 0.7% of the FP32 roofline peak |
-| Arithmetic intensity | 43.38 FLOP/byte | On the memory-bound side of the FP32 ridge |
-| DRAM bandwidth | 7.76 GB/s | Achieved roofline traffic |
-| Occupancy | 8.33% achieved | 16.67% theoretical |
+| Profiled duration | 190.56 ms | Nsight Compute measurement |
+| Compute-path throughput | 0.336 TFLOP/s | scalar FP32; 0.7% of its roofline peak |
+| Hardware arithmetic intensity | 41.54 FLOP/byte | Hardware-executed compute-path operations per measured DRAM byte |
+| DRAM bandwidth | 8.10 GB/s | Measured device-memory traffic |
+| Occupancy | 8.34% achieved | 16.67% theoretical |
 | Theoretical blocks/SM | 2 | Limited by shared memory |
 | Registers | 40/thread | — |
 | Shared memory | 38.40 KB/block | 37.38 KB dynamic |
-| Shared-load bank-conflict ratio | 87.86% | 8.2-way average across load requests |
-| Shared-store bank-conflict ratio | 0.00% | No measured store conflicts |
+| Shared-load bank-conflict ratio | 87.86% | Above Nsight's 10% warning threshold |
+| Shared-store bank-conflict ratio | 0.00% | No measured conflicts |
 
 V1 follows the basic FA1 idea. It avoids the full attention matrix and extra
 transposes, and it uses warp reductions for softmax. Its biggest problem is the
@@ -132,16 +136,16 @@ tune a launch with only 48 blocks.
 Profiling
 | Metric | Value | Interpretation |
 | --- | ---: | --- |
-| Profiled duration | 107.44 ms | — |
-| FP32 throughput | 0.562 TFLOP/s | About 1.2% of the FP32 roofline peak |
-| Arithmetic intensity | 70.30 FLOP/byte | Approximately at the FP32 ridge |
-| DRAM bandwidth | 7.99 GB/s | Achieved roofline traffic |
-| Occupancy | 8.35% achieved | 8.33% theoretical |
+| Profiled duration | 107.29 ms | Nsight Compute measurement |
+| Compute-path throughput | 0.562 TFLOP/s | scalar FP32; 1.2% of its roofline peak |
+| Hardware arithmetic intensity | 62.03 FLOP/byte | Hardware-executed compute-path operations per measured DRAM byte |
+| DRAM bandwidth | 9.07 GB/s | Measured device-memory traffic |
+| Occupancy | 8.33% achieved | 8.33% theoretical |
 | Theoretical blocks/SM | 1 | Limited by shared memory |
 | Registers | 40/thread | — |
 | Shared memory | 59.39 KB/block | 58.37 KB dynamic |
-| Shared-load bank-conflict ratio | 88.05% | 8.4-way average across load requests |
-| Shared-store bank-conflict ratio | 0.00% | No measured store conflicts |
+| Shared-load bank-conflict ratio | 88.05% | Above Nsight's 10% warning threshold |
+| Shared-store bank-conflict ratio | 0.00% | No measured conflicts |
 
 V2 adds FA2-style query tiles and gives each warp complete score rows. That
 raises the grid from 48 blocks to 1,536, so there is plenty of work for every SM.
@@ -160,16 +164,16 @@ softmax state and output into registers and reuse the shared buffers.
 Profiling
 | Metric | Value | Interpretation |
 | --- | ---: | --- |
-| Profiled duration | 6.53 ms | — |
-| FP32 throughput | 8.89 TFLOP/s | About 18% of the FP32 roofline peak |
-| Arithmetic intensity | 362.30 FLOP/byte | On the compute-bound side of the FP32 ridge |
-| DRAM bandwidth | 24.54 GB/s | Achieved roofline traffic |
-| Occupancy | 48.44% achieved | 50.00% theoretical |
-| Theoretical blocks/SM | 3 | Limited jointly by registers and shared memory |
+| Profiled duration | 6.55 ms | Nsight Compute measurement |
+| Compute-path throughput | 8.856 TFLOP/s | scalar FP32; 18.3% of its roofline peak |
+| Hardware arithmetic intensity | 352.90 FLOP/byte | Hardware-executed compute-path operations per measured DRAM byte |
+| DRAM bandwidth | 25.10 GB/s | Measured device-memory traffic |
+| Occupancy | 48.33% achieved | 50.00% theoretical |
+| Theoretical blocks/SM | 3 | Limited by registers, shared memory |
 | Registers | 80/thread | — |
 | Shared memory | 33.79 KB/block | 32.77 KB dynamic |
-| Shared-load bank-conflict ratio | 46.67% | 2.9-way average across load requests |
-| Shared-store bank-conflict ratio | 2.65% | Below Nsight's 10% warning threshold |
+| Shared-load bank-conflict ratio | 46.67% | Above Nsight's 10% warning threshold |
+| Shared-store bank-conflict ratio | 2.61% | Below Nsight's 10% warning threshold |
 
 V3 uses `D=64` because it makes the warp-local state easy to express with
 fixed-size per-thread arrays that the compiler can keep in registers. Other head
@@ -203,16 +207,16 @@ giving 50% theoretical occupancy (`24 / (1,536 / 32) = 50%`).
 Profiling
 | Metric | Value | Interpretation |
 | --- | ---: | --- |
-| Profiled duration | 4.12 ms | — |
-| FP32 throughput | 14.10 TFLOP/s | About 29% of the FP32 roofline peak |
-| Arithmetic intensity | 376.36 FLOP/byte | On the compute-bound side of the FP32 ridge |
-| DRAM bandwidth | 37.47 GB/s | Achieved roofline traffic |
-| Occupancy | 48.39% achieved | 50.00% theoretical |
-| Theoretical blocks/SM | 3 | Limited jointly by registers and shared memory |
+| Profiled duration | 4.11 ms | Nsight Compute measurement |
+| Compute-path throughput | 14.113 TFLOP/s | scalar FP32; 29.0% of its roofline peak |
+| Hardware arithmetic intensity | 372.67 FLOP/byte | Hardware-executed compute-path operations per measured DRAM byte |
+| DRAM bandwidth | 37.87 GB/s | Measured device-memory traffic |
+| Occupancy | 48.25% achieved | 50.00% theoretical |
+| Theoretical blocks/SM | 3 | Limited by registers, shared memory |
 | Registers | 80/thread | — |
 | Shared memory | 33.92 KB/block | 32.90 KB dynamic |
 | Shared-load bank-conflict ratio | <0.01% | Below Nsight's 10% warning threshold |
-| Shared-store bank-conflict ratio | 29.38% | 1.9-way average across store requests |
+| Shared-store bank-conflict ratio | 29.40% | Above Nsight's 10% warning threshold |
 
 V4 keeps the same algorithm and warp mapping as V3. It just adds a few
 lower-level CUDA optimizations. Under the standardized benchmark, they cut
@@ -256,8 +260,16 @@ FP32.
 Profiling
 | Metric | Value | Interpretation |
 | --- | ---: | --- |
+| Profiled duration | 4.53 ms | Nsight Compute measurement |
+| Compute-path throughput | 12.825 TFLOP/s | scalar FP32; 26.3% of its roofline peak |
+| Hardware arithmetic intensity | 858.23 FLOP/byte | Hardware-executed compute-path operations per measured DRAM byte |
+| DRAM bandwidth | 14.94 GB/s | Measured device-memory traffic |
+| Occupancy | 48.23% achieved | 50.00% theoretical |
+| Theoretical blocks/SM | 3 | Limited by registers |
+| Registers | 72/thread | — |
+| Shared memory | 17.54 KB/block | 16.51 KB dynamic |
 | Shared-load bank-conflict ratio | <0.01% | Below Nsight's 10% warning threshold |
-| Shared-store bank-conflict ratio | 2.72% | Below Nsight's 10% warning threshold |
+| Shared-store bank-conflict ratio | 2.74% | Below Nsight's 10% warning threshold |
 
 Accuracy
 | Implementation | Max abs | Mean abs | RMSE | Relative L2 |
@@ -292,13 +304,17 @@ cuobjdump --dump-sass flash_attention_v4_fp16*.so \
 Profiling
 | Metric | Value | Interpretation |
 | --- | ---: | --- |
-| Latency | 2240.18 µs | 25 warmups followed by 50 timed calls |
-| Profiled duration | 2.30 ms | Nsight Compute measurement |
-| Tensor-pipe active cycles | 11.51% | Both QK and PV execute on tensor cores |
-| Occupancy | 48.14% achieved | 50.00% theoretical |
-| Dynamic shared memory | 25.09 KB/block | Limits residency to three blocks/SM |
-| Shared-load bank-conflict ratio | 43.40% | 3.8-way average across load requests |
-| Shared-store bank-conflict ratio | 64.46% | 3.3-way average across store requests |
+| Profiled duration | 2.29 ms | Nsight Compute measurement |
+| Compute-path throughput | 22.481 TFLOP/s | dense FP16 Tensor Core with FP32 accumulation; 23.1% of its roofline peak |
+| Hardware arithmetic intensity | 767.66 FLOP/byte | Hardware-executed compute-path operations per measured DRAM byte |
+| DRAM bandwidth | 29.29 GB/s | Measured device-memory traffic |
+| Occupancy | 48.17% achieved | 50.00% theoretical |
+| Theoretical blocks/SM | 3 | Limited by shared memory |
+| Registers | 64/thread | — |
+| Shared memory | 26.11 KB/block | 25.09 KB dynamic |
+| Shared-load bank-conflict ratio | 43.40% | Above Nsight's 10% warning threshold |
+| Shared-store bank-conflict ratio | 64.46% | Above Nsight's 10% warning threshold |
+| Tensor-pipe active cycles | 11.54% | Both QK and PV execute on Tensor Cores |
 
 Accuracy
 | Max abs | Mean abs | RMSE | Relative L2 |
