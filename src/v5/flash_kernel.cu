@@ -47,6 +47,8 @@ constexpr int HEAD_DIM = 64;
 constexpr float SOFTMAX_SCALE = 1.0F / 8.0F;
 // Shift consecutive K rows by four shared-memory banks.
 constexpr int K_SHARED_STRIDE = HEAD_DIM + 8;
+// Shift consecutive P rows by four shared-memory banks for WMMA operand loads.
+constexpr int P_SHARED_STRIDE = B_c + 8;
 constexpr int THREAD_BLOCK_SZ = 256;
 constexpr int NUM_WARPS = THREAD_BLOCK_SZ / WARP_SIZE;
 constexpr int WARP_TILE_ROWS = B_r / NUM_WARPS;
@@ -55,6 +57,9 @@ constexpr int WARP_TILE_ROWS = B_r / NUM_WARPS;
 constexpr int WMMA_M = WARP_TILE_ROWS;
 constexpr int WMMA_N = B_c;
 constexpr int WMMA_K = 16;
+// Physically pad each WMMA result row so consecutive rows do not begin at the
+// same shared-memory bank. The logical result tile remains [8, 32].
+constexpr int WMMA_RESULT_STRIDE = B_c + 4;
 
 static_assert(HEAD_DIM == 64, "V5 is specialized for D=64");
 static_assert(THREAD_BLOCK_SZ % WARP_SIZE == 0,
@@ -75,8 +80,9 @@ struct TileParams {
     static constexpr std::size_t sP_offset =
         sKV_shared_offset + (static_cast<std::size_t>(B_c) * K_SHARED_STRIDE);
     static constexpr std::size_t sS_offset_bytes =
-        (sP_offset + (static_cast<std::size_t>(B_r) * B_c)) * sizeof(half);
-    static constexpr std::size_t sS_elements = static_cast<std::size_t>(B_r) * B_c;
+        (sP_offset + (static_cast<std::size_t>(B_r) * P_SHARED_STRIDE)) * sizeof(half);
+    static constexpr std::size_t sS_elements =
+        static_cast<std::size_t>(NUM_WARPS) * WARP_TILE_ROWS * WMMA_RESULT_STRIDE;
     static constexpr std::size_t total_bytes = sS_offset_bytes + (sS_elements * sizeof(float));
 };
 static_assert(TileParams::sS_offset_bytes % 32 == 0,
@@ -245,7 +251,7 @@ __device__ __forceinline__ std::array<float, WARP_TILE_ROWS> score_ij(const half
     std::array<float, WARP_TILE_ROWS> wS_ij{};
     constexpr int lda = HEAD_DIM;
     constexpr int ldb = K_SHARED_STRIDE;
-    constexpr int ldacc = B_c;
+    constexpr int ldacc = WMMA_RESULT_STRIDE;
     static_assert(lda % 8 == 0, "WMMA half-precision lda must be a multiple of 8");
     static_assert(ldb % 8 == 0, "WMMA half-precision ldb must be a multiple of 8");
     static_assert(ldacc % 4 == 0, "WMMA float accumulator stride must be a multiple of 4");
@@ -273,14 +279,16 @@ __device__ __forceinline__ std::array<float, WARP_TILE_ROWS> score_ij(const half
     // Since the threadblock is 1d, we can simply partition sS by
     // the threadIdx's mapping to warp #
     const std::size_t warp = threadIdx.x / WARP_SIZE;
-    constexpr std::size_t WARP_SCORE_ELEMENTS = static_cast<std::size_t>(WARP_TILE_ROWS) * B_c;
+    constexpr std::size_t WARP_SCORE_ELEMENTS =
+        static_cast<std::size_t>(WARP_TILE_ROWS) * WMMA_RESULT_STRIDE;
     float *const warp_sS_ij = sS_ij + (warp * WARP_SCORE_ELEMENTS);
     wmma::store_matrix_sync(warp_sS_ij, acc_frag, ldacc, wmma::mem_row_major);
     __syncwarp(FULL_WARP_MASK);
 
 #pragma unroll
     for (int warp_row = 0; warp_row < WARP_TILE_ROWS; ++warp_row) {
-        wS_ij[static_cast<std::size_t>(warp_row)] = warp_sS_ij[(warp_row * B_c) + lane];
+        wS_ij[static_cast<std::size_t>(warp_row)] =
+            warp_sS_ij[(warp_row * WMMA_RESULT_STRIDE) + lane];
     }
 
     return wS_ij;
@@ -320,7 +328,7 @@ __device__ __forceinline__ void online_softmax_ij(half *const sP_ij_unnormalized
         wO_i_left_unnormalized[warp_row] *= old_scale;
         wO_i_right_unnormalized[warp_row] *= old_scale;
         wM_i_replicated[warp_row] = m_new;
-        sP_ij_unnormalized[(row * B_c) + lane] = __float2half_rn(p_value);
+        sP_ij_unnormalized[(row * P_SHARED_STRIDE) + lane] = __float2half_rn(p_value);
     }
 }
 
@@ -346,9 +354,9 @@ __device__ __forceinline__ void accumulate_PV_into_O_i(const half *const sP_ij_u
     static_assert(WMMA_N == WARP_SIZE);
     static_assert(B_c % WMMA_K == 0);
     static_assert(HEAD_DIM % WMMA_N == 0);
-    constexpr int ldp = B_c;
+    constexpr int ldp = P_SHARED_STRIDE;
     constexpr int ldv = K_SHARED_STRIDE;
-    constexpr int ldacc = WMMA_N;
+    constexpr int ldacc = WMMA_RESULT_STRIDE;
     static_assert(ldp % 8 == 0, "WMMA half-precision ldp must be a multiple of 8");
     static_assert(ldv % 8 == 0, "WMMA half-precision ldv must be a multiple of 8");
     static_assert(ldacc % 4 == 0, "WMMA float accumulator stride must be a multiple of 4");
@@ -357,7 +365,8 @@ __device__ __forceinline__ void accumulate_PV_into_O_i(const half *const sP_ij_u
     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
 
     const std::size_t warp = threadIdx.x / WARP_SIZE;
-    constexpr std::size_t WARP_OUTPUT_ELEMENTS = static_cast<std::size_t>(WARP_TILE_ROWS) * WMMA_N;
+    constexpr std::size_t WARP_OUTPUT_ELEMENTS =
+        static_cast<std::size_t>(WARP_TILE_ROWS) * WMMA_RESULT_STRIDE;
     float *const warp_sPV_ij = sS_ij + (warp * WARP_OUTPUT_ELEMENTS);
 
     // WMMA_M matches the eight warp-owned rows, but WMMA_N covers only half of D.
@@ -372,8 +381,8 @@ __device__ __forceinline__ void accumulate_PV_into_O_i(const half *const sP_ij_u
         for (int key_col = 0; key_col < B_c; key_col += WMMA_K) {
             // Load P[row_start : row_start + 8, key_col : key_col + 16].
             wmma::load_matrix_sync(p_frag,
-                                   sP_ij_unnormalized + (static_cast<ptrdiff_t>(row_start * B_c)) +
-                                       key_col,
+                                   sP_ij_unnormalized +
+                                       (static_cast<ptrdiff_t>(row_start * P_SHARED_STRIDE)) + key_col,
                                    ldp);
             // Load V[key_col : key_col + 16, output_col : output_col + 32].
             wmma::load_matrix_sync(v_frag, sV_j + (key_col * K_SHARED_STRIDE) + output_col, ldv);
@@ -388,7 +397,7 @@ __device__ __forceinline__ void accumulate_PV_into_O_i(const half *const sP_ij_u
 
         for (int warp_row = 0; warp_row < WARP_TILE_ROWS; ++warp_row) {
             // Lane l owns column l of this output tile for every warp-owned row.
-            const float contribution = warp_sPV_ij[(warp_row * WMMA_N) + lane];
+            const float contribution = warp_sPV_ij[(warp_row * WMMA_RESULT_STRIDE) + lane];
             if (output_col == 0) {
                 wO_i_left_unnormalized[warp_row] += contribution;
             } else {

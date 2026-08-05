@@ -47,3 +47,30 @@ W_M = 8, W_N = 32, W_K = 16, `m8n32k16` evenly divides Q @ K^T because
 output tiles. The half-precision leading dimensions must be multiples of eight.
 K and V therefore use a padded shared-memory row stride of 72 rather than 66;
 the padding also reduces shared-memory bank conflicts.
+
+## Why V5 needs new shared-memory padding
+
+V3, V4, and V5 use the same high-level 64-row query tiles, 32-row key/value
+tiles, and eight warp-owned query rows. The new padding is not caused by a new
+high-level tiling scheme. It is caused by replacing scalar lane-owned matrix
+products with collective WMMA fragment loads and stores.
+
+The scalar V3/V4 PV loop iterates over one key row at a time. Every lane reads
+the same `P[row, key_row]`, which shared memory can broadcast, while the lanes
+read consecutive V columns. P therefore does not need a padded row stride in
+that access pattern. The scalar result mapping is also explicit: each lane owns
+two output columns and keeps them in registers, so no shared result tile is
+needed. V4 does pad K from 64 to 65 floats for its separate scalar QK access
+pattern; the earlier kernels were not padding-free generally.
+
+WMMA changes both cases. `load_matrix_sync` distributes an entire P fragment
+across the warp through `LDSM` instructions instead of broadcasting one scalar
+P value. V5 therefore keeps 32 logical P columns but uses a 40-half physical
+row stride. WMMA also hides which accumulator elements belong to each lane, so
+V5 uses `store_matrix_sync` to materialize each logical `[8,32]` result before
+lanes reload their columns. That buffer uses a 36-float physical stride instead
+of 32. K and V use a 72-half physical stride to satisfy WMMA alignment and
+reduce their remaining `LDSM` conflicts.
+
+These paddings change only physical shared-memory addressing. The logical
+matrix shapes and attention calculation are unchanged.

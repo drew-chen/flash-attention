@@ -27,7 +27,8 @@ SDPA means scaled dot-product attention and refers here to PyTorch's
 
 Primary shape: `B=4, H=12, M=N=2048, D=64` (all implementations are non-causal).
 Every latency in the implementation table uses the same benchmark protocol: 25
-warmups followed by 50 timed calls.
+warmups followed by 50 timed calls. The updated V5 latency is the median of
+seven independent samples using that protocol.
 
 ### Roofline
 
@@ -52,12 +53,12 @@ uses the FP32 ceiling because it has FP16 storage but scalar FP32 arithmetic.
 | V3 | Warp-local FlashAttention-2 | FP32 | 6476.57 | −32.3% | V2 with warp-owned softmax/output state, register-blocked QK and PV, and reused K/V shared storage |
 | V4 | Optimized V3 | FP32 | 4111.20 | −57.0% | V3 with vectorized copies, forced inlining, padded shared K rows, and selective 32-bit indexing |
 | V4 FP16 | FP16 storage baseline | FP16 | 4514.22 | −52.8% | V4's scalar matmuls with FP16 storage and FP32 accumulation |
-| V5 | Tensor-core WMMA | FP16 | 2240.18 | −76.6% | WMMA QK and PV with FP32 accumulation and padded FP16 K/V shared rows |
+| V5 | Tensor-core WMMA | FP16 | 2204.73 | −77.0% | WMMA QK and PV with FP32 accumulation and padded operand/result shared rows |
 
 At `M=N=2048`, V5 is the fastest project implementation in this table. It was
-2,274.04 µs, or 50.4%, faster than the same-dtype V4 FP16 storage baseline. V5
-was 1,893.81 µs, or 45.8%, faster than FP32 SDPA. The dtype-matched FP16 SDPA
-reference was fastest overall at 620.32 µs, 1,619.86 µs, or 72.3%, faster than
+2,309.49 µs, or 51.2%, faster than the same-dtype V4 FP16 storage baseline. V5
+was 1,929.26 µs, or 46.7%, faster than FP32 SDPA. The dtype-matched FP16 SDPA
+reference was fastest overall at 620.32 µs, 1,584.41 µs, or 71.9%, faster than
 V5.
 
 ### Accuracy
@@ -304,17 +305,17 @@ cuobjdump --dump-sass flash_attention_v4_fp16*.so \
 Profiling
 | Metric | Value | Interpretation |
 | --- | ---: | --- |
-| Profiled duration | 2.29 ms | Nsight Compute measurement |
-| Compute-path throughput | 22.481 TFLOP/s | dense FP16 Tensor Core with FP32 accumulation; 23.1% of its roofline peak |
-| Hardware arithmetic intensity | 767.66 FLOP/byte | Hardware-executed compute-path operations per measured DRAM byte |
-| DRAM bandwidth | 29.29 GB/s | Measured device-memory traffic |
-| Occupancy | 48.17% achieved | 50.00% theoretical |
+| Profiled duration | 2.05 ms | Nsight Compute measurement |
+| Compute-path throughput | 25.202 TFLOP/s | dense FP16 Tensor Core with FP32 accumulation; 25.9% of its roofline peak |
+| Hardware arithmetic intensity | 944.42 FLOP/byte | Hardware-executed compute-path operations per measured DRAM byte |
+| DRAM bandwidth | 26.68 GB/s | Measured device-memory traffic |
+| Occupancy | 48.31% achieved | 50.00% theoretical |
 | Theoretical blocks/SM | 3 | Limited by shared memory |
 | Registers | 64/thread | — |
-| Shared memory | 26.11 KB/block | 25.09 KB dynamic |
-| Shared-load bank-conflict ratio | 43.40% | Above Nsight's 10% warning threshold |
-| Shared-store bank-conflict ratio | 64.46% | Above Nsight's 10% warning threshold |
-| Tensor-pipe active cycles | 11.54% | Both QK and PV execute on Tensor Cores |
+| Shared memory | 28.16 KB/block | 27.14 KB dynamic |
+| Shared-load bank-conflict ratio | 34.92% | Above Nsight's 10% warning threshold |
+| Shared-store bank-conflict ratio | 2.27% | Below Nsight's 10% warning threshold |
+| Tensor-pipe active cycles | 12.96% | Both QK and PV execute on Tensor Cores |
 
 Accuracy
 | Max abs | Mean abs | RMSE | Relative L2 |
@@ -329,12 +330,31 @@ Softmax and the running output remain FP32 and register-resident.
 
 WMMA hides its lane-to-accumulator mapping, so V5 stores each warp's `[8,32]`
 QK score or PV contribution in its region of the FP32 shared `sS_ij` buffer
-before lanes reload their columns. K and V share a padded allocation with
-stride `HEAD_DIM + 8 = 72`.
+before lanes reload their columns. The result remains logically `[8,32]`, but
+its physical row stride is 36 floats. Padding the original 32-float stride by
+four shifts consecutive rows across four shared-memory banks. It reduced the
+shared-store bank-conflict ratio from 64.46% to 2.04% and the fixed-clock
+profiled duration from 2.29 ms to 2.12 ms, or 7.4%, while adding 1.02 KB of
+dynamic shared memory without changing three-block residency.
+
+Shared P also remains logically 32 columns wide but uses a physical row stride
+of 40 halves. Compared with the result-padded kernel, adding eight halves per P
+row reduced shared-load bank conflicts from 62.94 million to 44.06 million, or
+30.0%, and fixed-clock profiled duration from 2.12 ms to 2.05 ms, or 3.7%. It
+adds another 1.03 KB of dynamic shared memory without changing residency.
+
+This P padding is specific to V5's WMMA access pattern. In the scalar V3/V4 PV
+loop, every lane reads the same P element at each key-row step, so shared memory
+broadcasts the value without a conflict. WMMA instead distributes a P matrix
+fragment across lanes through `LDSM` loads, making the physical row stride part
+of the bank mapping. V3/V4 also keep their scalar matrix-product results in
+known per-lane registers, so they do not need V5's shared WMMA-result buffer.
+
+K and V share a separate padded allocation with stride
+`HEAD_DIM + 8 = 72`.
 The eight-half padding is the smallest WMMA-compatible increment and shifts
 consecutive rows by four shared-memory banks, reducing but not eliminating the
-K/V `LDSM` load conflicts. It does not affect the conflict-heavy WMMA result
-stores into `sS_ij`.
+K/V `LDSM` load conflicts. Shared-load conflicts therefore remain at 34.92%.
 
 Next steps:
 

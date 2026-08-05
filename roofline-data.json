@@ -10,9 +10,9 @@
   "application_roofline": {
     "definition": "algorithmic QK+PV FLOPs divided by complete-call duration and measured DRAM traffic",
     "hardware_limits": {
-      "fp32_peak_tflop_per_s": 48.644964717096954,
-      "fp16_tensor_peak_tflop_per_s": 97.28992943419391,
-      "dram_peak_gb_per_s": 690.6209243296
+      "fp32_peak_tflop_per_s": 48.629383154196475,
+      "fp16_tensor_peak_tflop_per_s": 97.25876630839295,
+      "dram_peak_gb_per_s": 690.6259838208
     },
     "points": {
       "baseline": {
@@ -72,11 +72,11 @@
         "dram_traffic_gb": 0.065841024
       },
       "v5": {
-        "arithmetic_intensity_flop_per_byte": 767.9033324814915,
-        "performance_tflop_per_s": 22.461338465400384,
-        "duration_ms": 2.294592,
-        "dram_bandwidth_gb_per_s": 29.250216160432878,
-        "dram_traffic_gb": 0.067117312
+        "arithmetic_intensity_flop_per_byte": 944.4193362261053,
+        "performance_tflop_per_s": 25.201657606909823,
+        "duration_ms": 2.0450880000000002,
+        "dram_bandwidth_gb_per_s": 26.684817474847044,
+        "dram_traffic_gb": 0.0545728
       }
     }
   }
