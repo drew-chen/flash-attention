@@ -52,11 +52,11 @@ adds a few lower-level optimizations:
 Like V3, the kernel aims to fit at least two blocks per SM and does not use
 tensor cores or an asynchronous pipeline.
 
-The code below implements the D=64 specialization described above. Other head
-dimensions are redirected to V2 by the C++ binding.
+The code below implements the D=64 specialization described above.
+`flash_forward_v4()` in flash.cpp redirects other head dimensions to V2.
 
-Variables are named similar to the FA1 paper: the s prefix means shared mem
-ptr, the g prefix means global mem ptr, and _i means a subscript of i.
+Variables are named similarly to the FA1 paper: `s` prefixes shared-memory
+pointers, `g` prefixes global-memory pointers, and `_i` denotes a subscript.
 */
 
 namespace flash_attention {
@@ -78,6 +78,8 @@ static_assert(HEAD_DIM == 64, "V4 is specialized for D=64");
 static_assert(THREAD_BLOCK_SZ % WARP_SIZE == 0,
               "V4 thread block size must contain a whole number of warps");
 static_assert(B_r % NUM_WARPS == 0, "V4 Q rows must divide evenly among warps");
+static_assert(sizeof(float4) == 16, "float4 must hold one 16-byte global-memory word");
+static_assert(alignof(float4) == 16, "float4 loads require 16-byte alignment");
 
 enum class ReductionOp : std::uint8_t { SUM, MAX };
 
@@ -111,48 +113,54 @@ struct FlashForwardKernelParams {
  * blockIdx.x and blockIdx.y. Pass blockIdx.z for a Q/O tile and the K/V-loop
  * index for a K/V tile.
  */
-__device__ __forceinline__ std::size_t get_tile_offset(const int num_heads,
+__device__ __forceinline__ std::size_t get_tile_offset(const int H,
                                                        const int total_rows,
                                                        const int tile_rows,
                                                        const int tile_idx) {
     const int batch_idx = static_cast<int>(blockIdx.x);
     const int head_idx = static_cast<int>(blockIdx.y);
     const int row_offset =
-        (((batch_idx * num_heads) + head_idx) * total_rows) + (tile_idx * tile_rows);
+        (((batch_idx * H) + head_idx) * total_rows) + (tile_idx * tile_rows);
     return static_cast<std::size_t>(row_offset) * HEAD_DIM;
 }
 
 /**
  * Loads one D=64 tile with float4 global reads. s_row_stride may include K's
- * shared-memory padding. The C++ binding checks input alignment.
+ * shared-memory padding. Before launch, can_use_v4_vector_loads() in flash.cpp
+ * verifies that the Q/K/V base pointers are 16-byte aligned; otherwise the C++
+ * entry point redirects the call to V2. D=64 and four-float vector indexing
+ * keep every address loaded here 16-byte aligned.
  */
-__device__ void load_shared_tile_vectorized_half(float *const smem_ptr,
-                                                 const float *const gmem_ptr,
-                                                 const int H,
-                                                 const int total_rows,
-                                                 const int tile_rows,
-                                                 const int tile_i,
-                                                 const int s_row_stride) {
+__device__ void load_shared_tile_vectorized(float *const smem_ptr,
+                                            const float *const gmem_ptr,
+                                            const int H,
+                                            const int total_rows,
+                                            const int tile_rows,
+                                            const int tile_i,
+                                            const int s_row_stride) {
     static_assert(HEAD_DIM == 64, "V4 vectorized tile loads assume D=64");
     constexpr int VECTOR_WIDTH = 4;
     constexpr int VECTORS_PER_ROW = HEAD_DIM / VECTOR_WIDTH;
-    const int vector_tile_size = tile_rows * VECTORS_PER_ROW;
-    const int g_tile_start = tile_i * tile_rows;
-    const std::size_t g_tile_offset = get_tile_offset(H, total_rows, tile_rows, tile_i);
-    const auto *const g_tile_vectors = reinterpret_cast<const float4 *>(gmem_ptr + g_tile_offset);
+    const int vectors_per_tile = tile_rows * VECTORS_PER_ROW;
+    const int global_tile_start_row = tile_i * tile_rows;
+    const std::size_t global_tile_offset =
+        get_tile_offset(H, total_rows, tile_rows, tile_i);
+    const auto *const global_vectors =
+        reinterpret_cast<const float4 *>(gmem_ptr + global_tile_offset);
 
-    for (int vector_i = static_cast<int>(threadIdx.x); vector_i < vector_tile_size;
+    for (int vector_i = static_cast<int>(threadIdx.x); vector_i < vectors_per_tile;
          vector_i += blockDim.x) {
         const int s_row = vector_i / VECTORS_PER_ROW;
-        const int vector_col = vector_i % VECTORS_PER_ROW;
-        const float4 values = g_tile_start + s_row < total_rows
-                                  ? g_tile_vectors[vector_i]
+        const int vector_in_row = vector_i % VECTORS_PER_ROW;
+        const float4 values = global_tile_start_row + s_row < total_rows
+                                  ? global_vectors[vector_i]
                                   : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
-        float *const s_values = smem_ptr + (s_row * s_row_stride) + (vector_col * VECTOR_WIDTH);
-        s_values[0] = values.x;
-        s_values[1] = values.y;
-        s_values[2] = values.z;
-        s_values[3] = values.w;
+        float *const shared_values =
+            smem_ptr + (s_row * s_row_stride) + (vector_in_row * VECTOR_WIDTH);
+        shared_values[0] = values.x;
+        shared_values[1] = values.y;
+        shared_values[2] = values.z;
+        shared_values[3] = values.w;
     }
 }
 
@@ -161,7 +169,7 @@ __device__ float *load_Q_i(const FlashForwardKernelParams &p,
                            float *const smem_ptr,
                            const int tile_i) {
     float *const sQ_i = smem_ptr + TileParams::sQ_offset;
-    load_shared_tile_vectorized_half(sQ_i, p.gQ, p.H, p.M, B_r, tile_i, HEAD_DIM);
+    load_shared_tile_vectorized(sQ_i, p.gQ, p.H, p.M, B_r, tile_i, HEAD_DIM);
     return sQ_i;
 }
 
@@ -175,7 +183,7 @@ __device__ float *load_K_j(const FlashForwardKernelParams &p,
                            float *const smem_ptr,
                            const int tile_j) {
     float *const sK_j = smem_ptr + TileParams::sKV_shared_offset;
-    load_shared_tile_vectorized_half(sK_j, p.gK, p.H, p.N, B_c, tile_j, K_SHARED_STRIDE);
+    load_shared_tile_vectorized(sK_j, p.gK, p.H, p.N, B_c, tile_j, K_SHARED_STRIDE);
     return sK_j;
 }
 
@@ -184,7 +192,7 @@ __device__ float *load_V_j(const FlashForwardKernelParams &p,
                            float *const smem_ptr,
                            const int tile_j) {
     float *const sV_j = smem_ptr + TileParams::sKV_shared_offset;
-    load_shared_tile_vectorized_half(sV_j, p.gV, p.H, p.N, B_c, tile_j, HEAD_DIM);
+    load_shared_tile_vectorized(sV_j, p.gV, p.H, p.N, B_c, tile_j, HEAD_DIM);
     return sV_j;
 }
 
@@ -194,7 +202,7 @@ __device__ float *load_V_j(const FlashForwardKernelParams &p,
  */
 template <ReductionOp Op> __device__ __forceinline__ float warp_reduce(float initial_value) {
     float value = initial_value;
-    // Warp reduction pattern: compare 32 elements across 32 threads
+    // Warp reduction pattern: compare 32 elements across 32 threads.
     for (int offset = 16; offset >= 1; offset /= 2) {
         const float other =
             __shfl_down_sync(FULL_WARP_MASK, value, static_cast<unsigned int>(offset));

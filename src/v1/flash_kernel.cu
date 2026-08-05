@@ -34,18 +34,18 @@ namespace flash_attention {
 namespace {
 
 constexpr int THREAD_BLOCK_SZ = 128;
-// TODO: Reuse shared-memory buffers more tightly, then calculate B_R and B_C dynamically.
-// Data tile size != thread block size
+// TODO: Reuse shared-memory buffers more tightly, then calculate B_r and B_c dynamically.
+// Tile dimensions are independent of the thread-block size.
 constexpr std::size_t B_r = 32;
 constexpr std::size_t B_c = 32;
 
 enum class ReductionOp : std::uint8_t { SUM, MAX };
 enum class RhsAccess : std::uint8_t { ROW, COLUMN };
 
-// Activates all warps in a warp shuffle (all bits 1).
+// Marks all 32 lanes as participants in a warp shuffle.
 constexpr unsigned FULL_WARP_MASK = ~0U;
 
-// Stores values and offsets into shared-memory tiles
+// Stores values and offsets into shared-memory tiles.
 struct TileParams {
     TileParams(const std::size_t M, const std::size_t N, const std::size_t D) {
         TORCH_CHECK(M > 0, "M must be positive");
@@ -127,19 +127,19 @@ struct FlashForwardKernelParams {
 /**
  * Returns the flat offset for the batch and head selected by blockIdx.
  */
-__device__ __forceinline__ std::size_t get_batch_head_offset(const std::size_t num_heads,
+__device__ __forceinline__ std::size_t get_batch_head_offset(const std::size_t H,
                                                              const std::size_t total_rows,
                                                              const std::size_t total_cols) {
     const std::size_t batch_idx = static_cast<std::size_t>(blockIdx.x);
     const std::size_t head_idx = static_cast<std::size_t>(blockIdx.y);
-    return (batch_idx * num_heads + head_idx) * total_rows * total_cols;
+    return (batch_idx * H + head_idx) * total_rows * total_cols;
 }
 
 /**
- * Uses threadblock to load one contiguous data tile from global to shared memory.
+ * Uses the thread block to load one contiguous data tile from global to shared memory.
  *
  * gmem_ptr has shape [B, H, total_rows, total_cols]. blockIdx selects [B, H],
- * and tile_i selects the [tile_rows, total_cols] segment of [total_rows, total_cols]
+ * and tile_i selects the [tile_rows, total_cols] segment of [total_rows, total_cols].
  * Out-of-range rows use pad.
  * The caller must synchronize before consuming or reusing shared memory.
  * Setting total_cols == 1 loads a 1D tile (row-major).
@@ -159,10 +159,10 @@ __device__ void load_shared_tile(float *const smem_ptr,
     for (std::size_t flattened_i = static_cast<std::size_t>(threadIdx.x); flattened_i < s_tile_size;
          flattened_i += blockDim.x) {
         const std::size_t s_row = flattened_i / total_cols;
-        // Note: tile col idx == global co idx
+        // The tile and global column indices are the same.
         const std::size_t col = flattened_i % total_cols;
 
-        // Convert tile row into global row
+        // Convert the tile row into a global row.
         const std::size_t g_row = g_tile_start + s_row;
         if (g_row < total_rows) {
             const std::size_t g_idx = batch_head_offset + (g_row * total_cols) + col;
@@ -196,10 +196,10 @@ __device__ void save_shared_tile(const float *const smem_ptr,
     for (std::size_t flattened_i = static_cast<std::size_t>(threadIdx.x); flattened_i < s_tile_size;
          flattened_i += blockDim.x) {
         const std::size_t s_row = flattened_i / total_cols;
-        // Note: tile col idx == global co idx
+        // The tile and global column indices are the same.
         const std::size_t col = flattened_i % total_cols;
 
-        // Convert tile row into global row
+        // Convert the tile row into a global row.
         const std::size_t g_row = g_tile_start + s_row;
         if (g_row < total_rows) {
             const std::size_t g_idx = batch_head_offset + (g_row * total_cols) + col;
@@ -407,7 +407,7 @@ __device__ float *score_ij(const FlashForwardKernelParams &p,
  */
 template <ReductionOp Op> __device__ float warp_reduce(float initial_value) {
     float value = initial_value;
-    // Warp reduction pattern: compare 32 elements across 32 threads
+    // Warp reduction pattern: compare 32 elements across 32 threads.
     for (int offset = 16; offset >= 1; offset /= 2) {
         const float other =
             __shfl_down_sync(FULL_WARP_MASK, value, static_cast<unsigned int>(offset));

@@ -27,7 +27,8 @@ Dimensions:
 - (head_dim) D: head dimension.
 
 Inputs and output are contiguous CUDA float32 tensors. The optimized kernel is
-specialized for D=64; the C++ binding redirects other head dimensions to V2.
+specialized for D=64; `flash_forward_v3()` in flash.cpp redirects other head
+dimensions to V2.
 
 Algorithm and optimization notes: docs/v3-extended-notes.md
 */
@@ -79,7 +80,7 @@ struct FlashForwardKernelParams {
  * blockIdx.x and blockIdx.y. Pass blockIdx.z for a Q/O tile and the K/V-loop
  * index for a K/V tile.
  */
-__device__ std::size_t get_tile_offset(const std::size_t num_heads,
+__device__ std::size_t get_tile_offset(const std::size_t H,
                                        const std::size_t total_rows,
                                        const std::size_t total_cols,
                                        const std::size_t tile_rows,
@@ -87,7 +88,7 @@ __device__ std::size_t get_tile_offset(const std::size_t num_heads,
     const std::size_t batch_idx = static_cast<std::size_t>(blockIdx.x);
     const std::size_t head_idx = static_cast<std::size_t>(blockIdx.y);
     const std::size_t batch_head_offset =
-        ((batch_idx * num_heads) + head_idx) * total_rows * total_cols;
+        ((batch_idx * H) + head_idx) * total_rows * total_cols;
     return batch_head_offset + (tile_idx * tile_rows * total_cols);
 }
 
@@ -95,7 +96,7 @@ __device__ std::size_t get_tile_offset(const std::size_t num_heads,
  * Uses the thread block to load one contiguous data tile from global to shared memory.
  *
  * gmem_ptr has shape [B, H, total_rows, total_cols]. blockIdx selects [B, H],
- * and tile_i selects the [tile_rows, total_cols] segment of [total_rows, total_cols]
+ * and tile_i selects the [tile_rows, total_cols] segment of [total_rows, total_cols].
  * Out-of-range rows use pad.
  * The caller must synchronize before consuming or reusing shared memory.
  * Setting total_cols == 1 loads a 1D tile (row-major).
@@ -118,7 +119,7 @@ __device__ void load_shared_tile(float *const smem_ptr,
         // The tile and global column indices are the same.
         const std::size_t col = flattened_i % total_cols;
 
-        // Convert tile row into global row
+        // Convert the tile row into a global row.
         const std::size_t g_row = g_tile_start + s_row;
         if (g_row < total_rows) {
             const std::size_t g_idx = g_tile_offset + (s_row * total_cols) + col;

@@ -51,7 +51,7 @@ constexpr int THREAD_BLOCK_SZ = 256;
 constexpr int NUM_WARPS = THREAD_BLOCK_SZ / WARP_SIZE;
 constexpr int WARP_TILE_ROWS = B_r / NUM_WARPS;
 
-// Defines WMMA size to use
+// Per-warp WMMA tile shape.
 constexpr int WMMA_M = WARP_TILE_ROWS;
 constexpr int WMMA_N = B_c;
 constexpr int WMMA_K = 16;
@@ -97,7 +97,9 @@ struct FlashForwardKernelParams {
 // memory instruction only when naturally aligned. Eight halves form a supported
 // 16-byte word, but a plain half[8] aggregate is only 2-byte aligned, so
 // alignas(16) supplies the type alignment required for a single 128-bit load.
-// The binding separately checks that the actual addresses meet that requirement.
+// Before launch, check_v5_kernel_requirements() in flash.cpp verifies that the
+// Q/K/V base pointers are actually 16-byte aligned. D=64 and eight-half vector
+// indexing then keep every address loaded by this kernel 16-byte aligned.
 // https://docs.nvidia.com/cuda/archive/13.0.0/cuda-c-programming-guide/index.html#device-memory-accesses
 struct alignas(16) Half8 {
     half values[8];
@@ -110,21 +112,21 @@ static_assert(alignof(Half8) == 16, "Half8 must be naturally aligned for a 16-by
  * blockIdx.x and blockIdx.y. Pass blockIdx.z for a Q/O tile and the K/V-loop
  * index for a K/V tile.
  */
-__device__ __forceinline__ std::size_t get_tile_offset(const int num_heads,
+__device__ __forceinline__ std::size_t get_tile_offset(const int H,
                                                        const int total_rows,
                                                        const int tile_rows,
                                                        const int tile_idx) {
     const int batch_idx = static_cast<int>(blockIdx.x);
     const int head_idx = static_cast<int>(blockIdx.y);
     const int row_offset =
-        (((batch_idx * num_heads) + head_idx) * total_rows) + (tile_idx * tile_rows);
+        (((batch_idx * H) + head_idx) * total_rows) + (tile_idx * tile_rows);
     return static_cast<std::size_t>(row_offset) * HEAD_DIM;
 }
 
 /**
  * Loads one D=64 tile with 16-byte global reads. Each read contains eight half
- * values. s_row_stride may include K's shared-memory padding. The C++ binding
- * checks input alignment.
+ * values. s_row_stride may include K's shared-memory padding. The C++ entry
+ * point checks input alignment before launching this kernel.
  */
 __device__ void load_shared_tile_vectorized(half *const smem_ptr,
                                             const half *const gmem_ptr,
@@ -136,23 +138,26 @@ __device__ void load_shared_tile_vectorized(half *const smem_ptr,
     static_assert(HEAD_DIM == 64, "V5 vectorized tile loads assume D=64");
     constexpr int VECTOR_WIDTH = 8;
     constexpr int VECTORS_PER_ROW = HEAD_DIM / VECTOR_WIDTH;
-    const int vector_tile_size = tile_rows * VECTORS_PER_ROW;
-    const int g_tile_start = tile_i * tile_rows;
-    const std::size_t g_tile_offset = get_tile_offset(H, total_rows, tile_rows, tile_i);
-    const auto *const g_tile_vectors = reinterpret_cast<const Half8 *>(gmem_ptr + g_tile_offset);
+    const int vectors_per_tile = tile_rows * VECTORS_PER_ROW;
+    const int global_tile_start_row = tile_i * tile_rows;
+    const std::size_t global_tile_offset =
+        get_tile_offset(H, total_rows, tile_rows, tile_i);
+    const auto *const global_vectors =
+        reinterpret_cast<const Half8 *>(gmem_ptr + global_tile_offset);
 
-    for (int vector_i = static_cast<int>(threadIdx.x); vector_i < vector_tile_size;
+    for (int vector_i = static_cast<int>(threadIdx.x); vector_i < vectors_per_tile;
          vector_i += blockDim.x) {
         const int s_row = vector_i / VECTORS_PER_ROW;
-        const int vector_col = vector_i % VECTORS_PER_ROW;
+        const int vector_in_row = vector_i % VECTORS_PER_ROW;
         Half8 values{};
-        if (g_tile_start + s_row < total_rows) {
-            values = g_tile_vectors[vector_i];
+        if (global_tile_start_row + s_row < total_rows) {
+            values = global_vectors[vector_i];
         }
-        half *const s_values = smem_ptr + (s_row * s_row_stride) + (vector_col * VECTOR_WIDTH);
+        half *const shared_values =
+            smem_ptr + (s_row * s_row_stride) + (vector_in_row * VECTOR_WIDTH);
 #pragma unroll
         for (int value_i = 0; value_i < VECTOR_WIDTH; ++value_i) {
-            s_values[value_i] = values.values[value_i];
+            shared_values[value_i] = values.values[value_i];
         }
     }
 }
@@ -195,7 +200,7 @@ __device__ half *load_V_j(const FlashForwardKernelParams &p,
  */
 template <ReductionOp Op> __device__ __forceinline__ float warp_reduce(float initial_value) {
     float value = initial_value;
-    // Warp reduction pattern: compare 32 elements across 32 threads
+    // Warp reduction pattern: compare 32 elements across 32 threads.
     for (int offset = 16; offset >= 1; offset /= 2) {
         const float other =
             __shfl_down_sync(FULL_WARP_MASK, value, static_cast<unsigned int>(offset));
