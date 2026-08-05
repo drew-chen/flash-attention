@@ -6,114 +6,28 @@
 #include <limits>
 
 /*
-These notes describe my simplified implementation of Tri Dao's flash attention 2.
+V2 simplified FlashAttention-2 forward kernel.
 
-flash_forward_cuda_launch expects raw pointers for tensors shaped as:
-
-- q: [B, H, N, D]
+API:
+- q: [B, H, M, D]
 - k: [B, H, N, D]
 - v: [B, H, N, D]
+- out: [B, H, M, D]
 
-- out: [B, H, N, D]
+For each batch element b and head h:
 
-  For each batch element b and head h, out[b, h] =
-  softmax((q[b, h] * k[b, h]^T) / sqrt(D)) * v[b, h].
+    out[b, h] = softmax((q[b, h] @ k[b, h]^T) / sqrt(D)) @ v[b, h]
 
 Dimensions:
+- (batch_size) B: batch size.
+- (num_heads) H: number of attention heads.
+- (query_seq_len) M: number of query/output rows.
+- (kv_seq_len) N: number of key/value rows. M and N may differ.
+- (head_dim) D: head dimension.
 
-- (batch_size) B: batch size. How many independent sequences are processed together.
-- (num_heads) H: number of attention heads per sequence.
-- (seq_len) N: self-attention sequence length. In general attention, Q has M rows
-  and K/V have N rows; this implementation is specialized to M = N = seq_len.
-  Can also be thought of as context length.
-- (head_dim) D: head dimension. Size of the per-token vector inside one head.
+Inputs and output are contiguous CUDA float32 tensors.
 
-Extended notes: docs/v2-extended-notes.md
-
-Algorithm:
-
-Initialize:
-    B_c = 32    # Number of score cols and K/V rows
-                # processed per data tile (can be tuned).
-    B_r = 64    # Number of score rows and Q rows
-                # processed per data tile (can be tuned).
-
-    T_c = ceil(N / B_c)  # Number of K/V blocks
-    T_r = ceil(M / B_r)  # Number of Q blocks
-
-    # This represents conceptual state for one Q tile. Each warp owns the
-    # entries corresponding to one or more complete query rows.
-
-    m_i = fill(B_r, -infinity) # (B_r): Running maximum state for a Q tile.
-    l_i = zeros(B_r)           # (B_r): Running softmax denominator state.
-    O_i = zeros(B_r, D)        # (B_r x D): Unnormalized running output state.
-
-
-
-# Each thread block selects rows of queries and calculates rows of O output.
-
-# -- Load shared memory 2D tile dim (B_r x D) --
-
-s_Q_i = Q[b, h, i*B_r: min((i + 1)*B_r, M), :]
-
-
-for each K/V block j = 0 to T_c - 1:
-
-    s_K_j = K[b, h, j*B_c: min((j + 1)*B_c, N), :]
-    s_V_j = V[b, h, j*B_c: min((j + 1)*B_c, N), :]
-
-        # (B_c x D): Save up to B_c rows of K and V into shared memory.
-
-
-    s_S_ij = s_Q_i @ s_K_j^T / sqrt(D)
-
-        # (B_r, B_c). Each warp owns one or more complete rows of S_ij.
-        # This can be in shared memory for this implementation.
-
-
-    w_mnew_i = max(m_i, rowmax(S_ij))
-
-        # (B_r). Each warp calculates the entries for its owned rows. m_i
-        # contains the running maximum from the previous K/V-tile iteration.
-
-
-    s_P_unscaled_ij = exp(s_S_ij - w_mnew_i)
-
-        # (B_r x B_c) Calculate running probabilities using the updated max
-        # though skip applying softmax denominator here. This can re-use
-        # the shared-memory buffer allocated for S_ij.
-
-
-    w_m_i_rescale_factor = exp(w_m_i - w_mnew_i)
-
-        # (B_r): By multiplying by this constant, the exp scale of the previous
-        iteration is updated to this iteration's max. 
-
-    w_l_i = m_i_rescale_factor*l_i + rowsum(P_unscaled_ij)
-
-        # (B_r): Update running denominator. By the end of the algorithm,
-        # l_i is the denominator for each row of rowsoftmax(S).
-
-    # -- Compute running output --
-
-    w_O_i = _O_i * m_i_rescale_factor + P_unscaled_ij @ V_j
-
-        # (B_r x D): Rescale softmax numerator for running output then
-        # add this tile to the running output.
-
-    w_m_i = w_mnew_i
-
-# Apply the softmax denominator once after processing every K/V tile.
-O[b, h, i*B_r: min((i + 1)*B_r, M), :] = O_i / l_i
-
----
-
-The following implementation is a simplified version of FA2. For ease of
-implementation, it stores some state in shared memory even where FA2's
-warp-local ownership would allow that state to remain in registers.
-
-Variables are named similar to the FA1 paper: the s prefix means shared mem
-ptr, the g prefix means global mem ptr, and _i means a subscript of i.
+Algorithm and optimization notes: docs/v2-extended-notes.md
 */
 
 namespace flash_attention {

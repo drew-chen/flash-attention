@@ -9,61 +9,29 @@
 #include <limits>
 
 /*
-My next steps involve experimenting with tensor cores. As tensor cores are
-optimized for fp16 (relative to the higher accuracy tf32) and fp16 storage
-reduces memory bandwidth by half, it is naturally to update the input
-Q, K and V to fp16 and keep accumulation to fp32 to maintain precision relative
-to v4. As a fair baseline
-for future tensor core performance, my existing v4 will be adapted to
-use fp16 inputs and fp32 accumulation.
+V4 FP16 storage-baseline forward kernel.
 
-flash_forward_v4_fp16_cuda_launch expects raw pointers for tensors shaped as:
+API:
+- q: [B, H, M, 64]
+- k: [B, H, N, 64]
+- v: [B, H, N, 64]
+- out: [B, H, M, 64]
 
-- q: [B, H, M, D]
-- k: [B, H, N, D]
-- v: [B, H, N, D]
+For each batch element b and head h:
 
-- out: [B, H, M, D]
-
-  For each batch element b and head h, out[b, h] =
-  softmax((q[b, h] * k[b, h]^T) / sqrt(D)) * v[b, h].
+    out[b, h] = softmax((q[b, h] @ k[b, h]^T) / sqrt(64)) @ v[b, h]
 
 Dimensions:
-
-- (batch_size) B: batch size. How many independent sequences are processed together.
-- (num_heads) H: number of attention heads per sequence.
+- (batch_size) B: batch size.
+- (num_heads) H: number of attention heads.
 - (query_seq_len) M: number of query/output rows.
-- (kv_seq_len) N: number of key/value rows. Self-attention uses M = N, while
-  cross-attention may use different lengths.
-- (head_dim) D: head dimension. Size of the per-token vector inside one head.
+- (kv_seq_len) N: number of key/value rows. M and N may differ.
+- (head_dim) D: head dimension, fixed at 64.
 
-V4 FP16 implementation:
+Inputs and output are contiguous CUDA float16 tensors with 16-byte-aligned base
+addresses. QK scores, online-softmax state, and output accumulators remain FP32.
 
-V4 FP16 uses the same D=64 FA2-style algorithm and warp ownership as V3 and V4.
-V3's Algorithm section is the canonical ownership and distribution reference.
-The algorithm to choose between fp16 and fp32 is simple. Inputs to
-matrix multiplications should aim to be fp16, which uses less global and shared
-memory and gets them ready for tensor cores. If a value may exceed max(fp16) =
-65,504, it should be fp32. Values built from many accumulations or reductions
-should also be fp32, since fp16 rounding error can add up even when the final
-value fits in fp16.
-
-This makes Q, K, V, and the copy of P used by the matrix multiplication fp16.
-The QK scores, softmax state m and l, and output accumulators stay fp32. P is an
-interesting case because its unnormalized value is
-
-    p_ij = exp(s_ij - m_i_new).
-
-Safe softmax subtracts the updated row maximum, so m_i_new >= s_ij and the
-exponent is always zero or negative. exp(0) is 1, while exp of a negative value
-is a positive fraction below 1. This means 0 < p_ij <= 1 for valid entries
-(masked entries use zero). Even though P has not been normalized by l yet, it
-cannot overflow fp16. Very small probabilities can still round or underflow,
-so I compute exp and the l reduction in fp32, then store a rounded fp16 copy of
-P for the PV matrix multiplication.
-
-PV accumulates into fp32 output registers. At the end I normalize by l in fp32
-and round once to fp16 when writing the final output.
+Algorithm and precision notes: docs/v4-fp16-extended-notes.md
 */
 
 namespace flash_attention {
