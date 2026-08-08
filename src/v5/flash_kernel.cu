@@ -372,20 +372,24 @@ __device__ __forceinline__ void accumulate_PV_into_O_i(const half *const sP_ij_u
     // WMMA_M matches the eight warp-owned rows, but WMMA_N covers only half of D.
     //   Desired: [8, 32] @ [32, 64]
     //   WMMA:    [8, 16] @ [16, 32]
-    // Therefore output_col selects the left or right [8, 32] output tile, while
-    // key_col performs the two K=16 matmuls needed to reduce across B_c=32.
-    for (int output_col = 0; output_col < HEAD_DIM; output_col += WMMA_N) {
+    // output_col_start selects the left or right [8, 32] output tile.
+    for (int output_col_start = 0; output_col_start < HEAD_DIM; output_col_start += WMMA_N) {
         // Start a new [8, 32] output tile at zero before accumulating across B_c.
         wmma::fill_fragment(acc_frag, 0.0F);
 
-        for (int key_col = 0; key_col < B_c; key_col += WMMA_K) {
-            // Load P[row_start : row_start + 8, key_col : key_col + 16].
+        // kv_pos_start advances through the two 16-position chunks shared by
+        // P's columns and V's rows.
+        for (int kv_pos_start = 0; kv_pos_start < B_c; kv_pos_start += WMMA_K) {
+            // Load P[row_start : row_start + 8, kv_pos_start : kv_pos_start + 16].
             wmma::load_matrix_sync(p_frag,
                                    sP_ij_unnormalized +
-                                       (static_cast<ptrdiff_t>(row_start * P_SHARED_STRIDE)) + key_col,
+                                       (static_cast<ptrdiff_t>(row_start * P_SHARED_STRIDE)) +
+                                       kv_pos_start,
                                    ldp);
-            // Load V[key_col : key_col + 16, output_col : output_col + 32].
-            wmma::load_matrix_sync(v_frag, sV_j + (key_col * K_SHARED_STRIDE) + output_col, ldv);
+            // Load V[kv_pos_start : kv_pos_start + 16,
+            //        output_col_start : output_col_start + 32].
+            wmma::load_matrix_sync(v_frag,
+                                   sV_j + (kv_pos_start * K_SHARED_STRIDE) + output_col_start, ldv);
             // acc_frag += p_frag @ v_frag.
             wmma::mma_sync(acc_frag, p_frag, v_frag, acc_frag);
         }
@@ -398,7 +402,7 @@ __device__ __forceinline__ void accumulate_PV_into_O_i(const half *const sP_ij_u
         for (int warp_row = 0; warp_row < WARP_TILE_ROWS; ++warp_row) {
             // Lane l owns column l of this output tile for every warp-owned row.
             const float contribution = warp_sPV_ij[(warp_row * WMMA_RESULT_STRIDE) + lane];
-            if (output_col == 0) {
+            if (output_col_start == 0) {
                 wO_i_left_unnormalized[warp_row] += contribution;
             } else {
                 wO_i_right_unnormalized[warp_row] += contribution;

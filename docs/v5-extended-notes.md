@@ -28,8 +28,8 @@ shared memory is still commonly used to stage MMA operands.
 
 ## Tensor core usage
 
-As tensor cores are designed for FMAs, the two places they can be used are the
-S = Q @ K^T and O = P @ V within a block's calculation.
+V5 applies tensor cores to both block-local matrix products: `S = Q @ K^T` and
+`O = P @ V`.
 
 V5 uses WMMA for both products while preserving the FA2-style warp ownership
 used by v3 and v4. The running O state stays in registers across K/V tiles. For
@@ -40,37 +40,49 @@ owned output columns to the register-resident O state. Q @ K^T uses the same
 shared-memory round trip to convert its accumulator fragment into the score
 columns owned by each lane.
 
-To use WMMA, we mainly need to think about the shape of each multiply. Using
-W_M = 8, W_N = 32, W_K = 16, `m8n32k16` evenly divides Q @ K^T because
-`[WARP_TILE_ROWS, D] @ [D, B_c] = [WARP_TILE_ROWS, B_c]`, or more concretely,
-`[8, 64] @ [64, 32]`. P @ V uses two K=16 steps for each of two 32-column
-output tiles. The half-precision leading dimensions must be multiples of eight.
-K and V therefore use a padded shared-memory row stride of 72 rather than 66;
-the padding also reduces shared-memory bank conflicts.
+### WMMA instruction mapping
 
-## Why V5 needs new shared-memory padding
+V5 uses `m8n32k16`. For Q @ K^T, `[8,64] @ [64,32]` already matches the
+instruction's `m=8` and `n=32`, while its shared dimension is `64`. Therefore,
+four `k=16` WMMA operations accumulate into the same `[8,32]` output fragment.
 
-V3, V4, and V5 use the same high-level 64-row query tiles, 32-row key/value
-tiles, and eight warp-owned query rows. The new padding is not caused by a new
-high-level tiling scheme. It is caused by replacing scalar lane-owned matrix
-products with collective WMMA fragment loads and stores.
+P @ V computes `[8,32] @ [32,64] = [8,64]`. Because `m8n32k16` produces an
+`[8,32]` output, the result is a `1x2` grid of WMMA output tiles. `O0` is the
+left tile accumulated in `wO_i_left_unnormalized`, and `O1` is the right tile
+accumulated in `wO_i_right_unnormalized`. Each spans all eight query rows and
+32 of the 64 output columns, requiring two `k=16` WMMA operations to reduce
+over the 32 K/V positions:
 
-The scalar V3/V4 PV loop iterates over one key row at a time. Every lane reads
-the same `P[row, key_row]`, which shared memory can broadcast, while the lanes
-read consecutive V columns. P therefore does not need a padded row stride in
-that access pattern. The scalar result mapping is also explicit: each lane owns
-two output columns and keeps them in registers, so no shared result tile is
-needed. V4 does pad K from 64 to 65 floats for its separate scalar QK access
-pattern; the earlier kernels were not padding-free generally.
+```text
+                 shared dim (32 K/V positions)
+P [8,32]       = [ P0 [8,16]  | P1 [8,16]  ]
 
-WMMA changes both cases. `load_matrix_sync` distributes an entire P fragment
-across the warp through `LDSM` instructions instead of broadcasting one scalar
-P value. V5 therefore keeps 32 logical P columns but uses a 40-half physical
-row stride. WMMA also hides which accumulator elements belong to each lane, so
-V5 uses `store_matrix_sync` to materialize each logical `[8,32]` result before
-lanes reload their columns. That buffer uses a 36-float physical stride instead
-of 32. K and V use a 72-half physical stride to satisfy WMMA alignment and
-reduce their remaining `LDSM` conflicts.
+                   output columns
+V [32,64]      = [ V00 [16,32] | V01 [16,32] ]  keys 0..15
+                 [ V10 [16,32] | V11 [16,32] ]  keys 16..31
 
-These paddings change only physical shared-memory addressing. The logical
-matrix shapes and attention calculation are unchanged.
+O [8,64]       = [ O0 [8,32]   | O1 [8,32]   ]
+
+O0 = P0 @ V00 + P1 @ V10
+O1 = P0 @ V01 + P1 @ V11
+```
+
+
+## Shared-memory padding
+
+WMMA requires half-precision leading dimensions to be multiples of eight and
+float accumulator strides to be multiples of four. The logical widths already
+meet those constraints, but padding changes the shared-memory bank mapping and
+reduces conflicts during collective fragment loads and stores.
+
+| Buffer | Logical row width | Physical row stride | Purpose |
+| --- | ---: | ---: | --- |
+| K/V | 64 half | 72 half | Preserve WMMA alignment and improve operand-load bank mapping |
+| P | 32 half | 40 half | Improve WMMA operand-load bank mapping |
+| Per-warp WMMA result | 32 float | 36 float | Improve the store and lane-reload bank mapping |
+
+The scalar v3/v4 P @ V loop can broadcast one P value while each lane keeps its
+output columns directly in registers. V5 instead loads P collectively and
+materializes WMMA results because their lane mapping is opaque, making padded P
+and result buffers useful. These strides change only physical shared-memory
+addressing; the logical tiles and attention calculation are unchanged.
