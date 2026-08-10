@@ -9,6 +9,7 @@ import torch
 import flash_attention_v4
 import flash_attention_v4_fp16
 import flash_attention_v5
+import flash_attention_v6
 from src.baseline import forward as reference_forward
 
 
@@ -36,6 +37,7 @@ IMPLEMENTATIONS = {
     "v4": Implementation(flash_attention_v4.forward_unchecked, torch.float32),
     "v4-fp16": Implementation(flash_attention_v4_fp16.forward_unchecked, torch.float16),
     "v5": Implementation(flash_attention_v5.forward_unchecked, torch.float16),
+    "v6": Implementation(flash_attention_v6.forward_unchecked, torch.float16),
 }
 
 

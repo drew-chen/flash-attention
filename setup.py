@@ -8,7 +8,17 @@ from setuptools import setup
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CUDA_ARCH_LIST = "8.9"
-VERSION_SUFFIXES = ("0", "1", "2", "3", "4", "4_fp16", "5")
+VERSION_SUFFIXES = (
+    "0",
+    "1",
+    "2",
+    "3",
+    "4",
+    "4_fp16",
+    "5",
+    "6",
+)
+
 
 def fail(message):
     raise SystemExit(f"\n[flash-attention setup] {message}\n")
