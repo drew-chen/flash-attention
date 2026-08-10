@@ -22,6 +22,7 @@ PROFILE_IMPLEMENTATIONS = (
     "v4",
     "v4-fp16",
     "v5",
+    "v6",
 )
 
 

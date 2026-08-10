@@ -39,9 +39,9 @@ compute-sanitizer --target-processes all python -m pytest -q
 
 ## Accuracy
 
-`accuracy.py` compares SDPA, SDPA FP16, V4, V4 FP16, and V5 with the FP32
-PyTorch reference and reports max absolute error, mean absolute error, RMSE,
-and relative L2 error. Run all implementations:
+`accuracy.py` compares SDPA, SDPA FP16, V4, V4 FP16, V5, and V6
+with the FP32 PyTorch reference and reports max absolute error, mean absolute
+error, RMSE, and relative L2 error. Run all implementations:
 
 ```bash
 python accuracy.py
@@ -67,8 +67,10 @@ python accuracy.py v5 \
 
 ## Benchmarks
 
-The fixed suite measures `M=N=512, 1024, 2048` at `B=4, H=12, D=64`, using
-25 warmups and 50 timed calls.
+The fixed suite measures `M=N=512, 1024, 2048` at `B=4, H=12, D=64`. Each
+implementation warms for at least 25 calls and 500 ms of completed GPU work,
+then reports the median and range of seven 50-call samples. Multiple selected
+implementations are timed in randomized, interleaved order.
 
 Benchmark every registered implementation:
 
@@ -89,7 +91,7 @@ python benchmark.py sdpa-fp16
 ```
 
 The required implementation argument accepts `all`, `baseline`, `sdpa`,
-`sdpa-fp16`, and `v0` through `v5`, plus `v4-fp16`.
+`sdpa-fp16`, `v0` through `v6`, and `v4-fp16`.
 
 The shape and timing counts can be overridden for larger, shorter benchmark
 runs:
@@ -101,7 +103,9 @@ python benchmark.py v5 \
   --head-dim 64 \
   --seq-lens 4096 \
   --warmup 5 \
-  --repetitions 10
+  --warmup-ms 500 \
+  --repetitions 10 \
+  --samples 7
 ```
 
 ## Profiling
