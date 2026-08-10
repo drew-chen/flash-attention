@@ -36,7 +36,7 @@ PyTorch 2.12.1, and CUDA 13.0.
 
 ### Roofline
 
-![Roofline comparison of profiled implementations](roofline.png)
+![Roofline comparison of profiled implementations](docs/assets/roofline.png)
 
 Every point divides the same algorithmic work by the complete call's Nsight
 Compute duration and measured DRAM traffic. V4 FP16 uses the FP32 ceiling
@@ -58,16 +58,15 @@ because only its storage is FP16.
 | V5 | FP16 | 144.07 | 507.37 | 1911.97 | Tensor-core WMMA for QK and PV |
 | V6 | FP16 | 124.08 | 458.42 | 1696.97 | Faster exponential and warp reductions |
 
-V0-V4 use FP32. V4 FP16 is the like-for-like scalar baseline for the FP16 V5
-and V6 kernels; the SDPA rows are external references. V6 is the fastest
-project kernel at every measured size. Relative to V5, it is 13.9%, 9.6%, and
-11.2% faster at sequence lengths 512, 1024, and 2048. At 2048 it is 60.7%
-faster than V4 FP16, while FP16 SDPA remains 64.8% faster than V6.
+V0–V4 use FP32. V4 FP16 is the scalar baseline for the FP16 V5 and V6 kernels.
+The SDPA rows are external references. V6 is the fastest project kernel at all
+three sizes. It is 13.9%, 9.6%, and 11.2% faster than V5 at sequence lengths
+512, 1024, and 2048. At 2048, it is 60.7% faster than V4 FP16, but FP16 SDPA is
+64.8% faster than V6.
 
-For cross-dtype context at 2048, V6's 1,696.97 µs latency is 56.4% lower than
-the fastest project FP32 kernel, V4 at 3,896.21 µs, and 57.3% lower than FP32
-SDPA at 3,970.91 µs. These comparisons include V6's FP16 storage and Tensor
-Core advantage; V4 FP16 remains the like-for-like scalar project baseline.
+At 2048, V6 is also 56.4% faster than V4, the fastest FP32 project kernel, and
+57.3% faster than FP32 SDPA. These are cross-dtype comparisons: V6 benefits
+from FP16 storage and Tensor Cores. V4 FP16 is the direct scalar baseline.
 
 ### Accuracy
 
@@ -79,9 +78,9 @@ Core advantage; V4 FP16 remains the like-for-like scalar project baseline.
 | V5 | FP16 | FP16 | 1.098e-4 | 7.862e-6 | 1.025e-5 | 2.819e-4 |
 | V6 | FP16 | FP16 | 1.098e-4 | 7.862e-6 | 1.025e-5 | 2.819e-4 |
 
-`python accuracy.py sdpa sdpa-fp16 v4-fp16 v5 v6` produced these against the FP32
-PyTorch reference at the primary shape with seed 0. FP32 runs use the exact
-FP16-generated inputs promoted to FP32.
+`python -m scripts.accuracy sdpa sdpa-fp16 v4-fp16 v5 v6` produced these
+against the FP32 PyTorch reference at the primary shape with seed 0. FP32 runs
+use the exact FP16-generated inputs promoted to FP32.
 
 V0–V4 use contiguous CUDA `float32`. V4 FP16, V5, V6, and FP16
 SDPA use `float16`. V0 requires `M=N`. V1–V6 accept Q `[B, H, M, D]` and K/V
@@ -190,10 +189,10 @@ Accuracy
 | V4 FP32 | 9.239e-7 | 2.928e-8 | 4.201e-8 | 1.156e-6 |
 | V4 FP16 | 1.098e-4 | 7.862e-6 | 1.025e-5 | 2.819e-4 |
 
-`python accuracy.py` produced these against the FP32 PyTorch reference at the
-primary shape with seed 0. V4 and the reference receive the same FP16 inputs
-promoted to FP32, excluding initial rounding. These measurements are not error
-bounds.
+`python -m scripts.accuracy` produced these against the FP32 PyTorch reference
+at the primary shape with seed 0. V4 and the reference receive the same FP16
+inputs promoted to FP32, excluding initial rounding. These measurements are
+not error bounds.
 
 V4 FP16 took 4,316.33 µs, 10.8% slower than V4. It still converts operands
 before scalar FP32 `FFMA`s, and its smaller shared allocation does not improve
@@ -226,9 +225,9 @@ Accuracy
 | SDPA FP16 | 1.098e-4 | 7.882e-6 | 1.027e-5 | 2.826e-4 |
 | V5 | 1.098e-4 | 7.862e-6 | 1.025e-5 | 2.819e-4 |
 
-`python accuracy.py sdpa-fp16 v5` produced these against the FP32 PyTorch
-reference at the primary shape with seed 0. Both receive the same FP16 inputs,
-return FP16 outputs, and have effectively equivalent measured accuracy.
+`python -m scripts.accuracy sdpa-fp16 v5` produced these against the FP32
+PyTorch reference at the primary shape with seed 0. Both receive the same FP16
+inputs, return FP16 outputs, and have effectively equivalent measured accuracy.
 
 V5 uses FP16 WMMA operands and FP32 accumulators for both matrix products. Each
 warp computes Q @ K as

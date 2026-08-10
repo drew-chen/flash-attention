@@ -16,32 +16,38 @@ from pathlib import Path
 import subprocess
 import sys
 
+from scripts.implementations import (
+    IMPLEMENTATION_LABELS,
+    TENSOR_CORE_IMPLEMENTATIONS,
+)
+from scripts.workload import (
+    BATCH_SIZE,
+    HEAD_DIM,
+    NUM_HEADS,
+    PRIMARY_SEQ_LEN,
+)
 
-REPO_ROOT = Path(__file__).resolve().parent
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 PYTHON_BIN = REPO_ROOT / ".venv" / "bin" / "python"
 REPORT_DIR = Path("/tmp")
-FP32_IMPLEMENTATIONS = (
-    "baseline",
-    "sdpa",
-    "v1",
-    "v2",
-    "v3",
-    "v4",
-    "v4-fp16",
-)
-REFERENCE_IMPLEMENTATIONS = ("baseline", "sdpa")
-SDPA_FP16 = "sdpa-fp16"
-FUSED_IMPLEMENTATIONS = ("v1", "v2", "v3", "v4", "v4-fp16", "v5")
-ALL_PROFILE_IMPLEMENTATIONS = (
-    *REFERENCE_IMPLEMENTATIONS,
-    SDPA_FP16,
-    *FUSED_IMPLEMENTATIONS,
-)
+ASSET_DIR = REPO_ROOT / "docs" / "assets"
 
-BATCH_SIZE = 4
-NUM_HEADS = 12
-SEQ_LEN = 2048
-HEAD_DIM = 64
+PLOT_COLORS = {
+    "baseline": "#DC2626",
+    "sdpa": "#F97316",
+    "v1": "#D946EF",
+    "v2": "#D4A000",
+    "v3": "#16A34A",
+    "v4": "#0284C7",
+    "v4-fp16": "#0891B2",
+    "sdpa-fp16": "#EA580C",
+    "v5": "#7C3AED",
+    "v6": "#4F46E5",
+}
+REFERENCE_IMPLEMENTATIONS = ("baseline", "sdpa")
+ALL_IMPLEMENTATIONS = tuple(PLOT_COLORS)
+
 # These are the only raw counters the custom application-level chart needs.
 # Hardware ceilings come from NVIDIA's built-in roofline sections below.
 DURATION_METRIC = "gpu__time_duration.sum"
@@ -53,11 +59,13 @@ ROOFLINE_SECTIONS = (
 )
 
 # QK and PV each perform 2 * B * H * M * N * D FLOPs.
-ATTENTION_FLOPS = 4 * BATCH_SIZE * NUM_HEADS * SEQ_LEN * SEQ_LEN * HEAD_DIM
+ATTENTION_FLOPS = (
+    4 * BATCH_SIZE * NUM_HEADS * PRIMARY_SEQ_LEN * PRIMARY_SEQ_LEN * HEAD_DIM
+)
 
 
 def report_path(implementation: str) -> Path:
-    return REPORT_DIR / f"flash_{implementation}_s2048_roofline.ncu-rep"
+    return REPORT_DIR / f"flash_{implementation}_s{PRIMARY_SEQ_LEN}_roofline.ncu-rep"
 
 
 def run(command: list[str]) -> None:
@@ -92,7 +100,8 @@ def profile_reports(ncu: str, implementations: tuple[str, ...]) -> None:
                 output,
                 "--force-overwrite",
                 str(PYTHON_BIN),
-                "profile_cuda.py",
+                "-m",
+                "scripts.profile_cuda",
                 implementation,
             )
         )
@@ -102,7 +111,7 @@ def profile_reports(ncu: str, implementations: tuple[str, ...]) -> None:
 def raw_metrics(ncu: str, report: Path) -> dict[str, float | str]:
     if not report.exists():
         raise FileNotFoundError(
-            f"missing {report}; run `{PYTHON_BIN} roofline.py --profile` first"
+            f"missing {report}; run `{PYTHON_BIN} -m scripts.roofline --profile` first"
         )
     completed = subprocess.run(
         [
@@ -296,9 +305,11 @@ def plot_roofline(
         label="FP16 Tensor Core roof",
     )
     annotation_offsets = {
-        "SDPA FP32": (14, -18),
+        "SDPA FP32": (14, -30),
         "SDPA FP16": (12, 8),
         "V4": (8, 10),
+        "V5 WMMA": (-78, 8),
+        "V6 WMMA": (10, 8),
     }
     for label, intensity, performance, color, marker in points:
         axis.scatter(
@@ -360,16 +371,10 @@ def main() -> None:
         help="collect fresh Nsight Compute reports before extracting and plotting",
     )
     parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=REPO_ROOT,
-        help="directory for JSON and PNG outputs (default: repository root)",
-    )
-    parser.add_argument(
         "--implementations",
         nargs="+",
-        choices=ALL_PROFILE_IMPLEMENTATIONS,
-        default=ALL_PROFILE_IMPLEMENTATIONS,
+        choices=ALL_IMPLEMENTATIONS,
+        default=ALL_IMPLEMENTATIONS,
         metavar="NAME",
         help="with --profile, refresh only these implementations (default: all)",
     )
@@ -379,22 +384,20 @@ def main() -> None:
     if args.profile:
         profile_reports(ncu, tuple(args.implementations))
 
-    required_reports = (*FP32_IMPLEMENTATIONS, "sdpa-fp16", "v5")
     metrics = {
         name: raw_metrics(ncu, report_path(name))
-        for name in dict.fromkeys(required_reports)
+        for name in ALL_IMPLEMENTATIONS
     }
     limits = hardware_limits(ncu, report_path("v5"))
-    all_implementations = (*FP32_IMPLEMENTATIONS, "sdpa-fp16", "v5")
     application_points = {
-        name: application_point(metrics[name]) for name in all_implementations
+        name: application_point(metrics[name]) for name in ALL_IMPLEMENTATIONS
     }
     data = {
         "shape": {
             "batch": BATCH_SIZE,
             "heads": NUM_HEADS,
-            "m": SEQ_LEN,
-            "n": SEQ_LEN,
+            "m": PRIMARY_SEQ_LEN,
+            "n": PRIMARY_SEQ_LEN,
             "d": HEAD_DIM,
         },
         "algorithmic_attention_flops": ATTENTION_FLOPS,
@@ -413,44 +416,23 @@ def main() -> None:
             "points": application_points,
         },
     }
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    json_output = args.output_dir / "roofline-data.json"
+    ASSET_DIR.mkdir(parents=True, exist_ok=True)
+    json_output = ASSET_DIR / "roofline-data.json"
+    image_output = ASSET_DIR / "roofline.png"
     json_output.write_text(json.dumps(data, indent=2) + "\n")
 
-    colors = {
-        "baseline": "#DC2626",
-        "sdpa": "#F97316",
-        "v1": "#D946EF",
-        "v2": "#D4A000",
-        "v3": "#16A34A",
-        "v4": "#0284C7",
-        "v4-fp16": "#0891B2",
-        "sdpa-fp16": "#EA580C",
-        "v5": "#7C3AED",
-    }
-    labels = {
-        "baseline": "PyTorch",
-        "sdpa": "SDPA FP32",
-        "v1": "V1",
-        "v2": "V2",
-        "v3": "V3",
-        "v4": "V4",
-        "v4-fp16": "V4 FP16",
-        "sdpa-fp16": "SDPA FP16",
-        "v5": "V5 WMMA",
-    }
     plot_points = [
         (
-            labels[name],
+            IMPLEMENTATION_LABELS[name],
             application_points[name]["arithmetic_intensity_flop_per_byte"],
             application_points[name]["performance_tflop_per_s"],
-            colors[name],
-            "D" if name in {"sdpa-fp16", "v5"} else "o",
+            PLOT_COLORS[name],
+            "D" if name in TENSOR_CORE_IMPLEMENTATIONS else "o",
         )
-        for name in all_implementations
+        for name in ALL_IMPLEMENTATIONS
     ]
     plot_roofline(
-        args.output_dir / "roofline.png",
+        image_output,
         "FlashAttention Roofline — RTX 4080",
         limits["fp32_peak_tflop_per_s"],
         limits["fp16_tensor_peak_tflop_per_s"],
@@ -462,7 +444,7 @@ def main() -> None:
     )
 
     print(f"Wrote {json_output}")
-    print(f"Wrote {args.output_dir / 'roofline.png'}")
+    print(f"Wrote {image_output}")
 
 
 if __name__ == "__main__":

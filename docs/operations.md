@@ -39,31 +39,22 @@ compute-sanitizer --target-processes all python -m pytest -q
 
 ## Accuracy
 
-`accuracy.py` compares SDPA, SDPA FP16, V4, V4 FP16, V5, and V6
+`scripts.accuracy` compares SDPA, SDPA FP16, V4, V4 FP16, V5, and V6
 with the FP32 PyTorch reference and reports max absolute error, mean absolute
 error, RMSE, and relative L2 error. Run all implementations:
 
 ```bash
-python accuracy.py
+python -m scripts.accuracy
 ```
 
 Or measure only V5:
 
 ```bash
-python accuracy.py v5
+python -m scripts.accuracy v5
 ```
 
-The shape and random seed can be overridden:
-
-```bash
-python accuracy.py v5 \
-  --batch-size 1 \
-  --num-heads 12 \
-  --query-seq-len 1024 \
-  --kv-seq-len 1024 \
-  --head-dim 64 \
-  --seed 0
-```
+Accuracy uses the canonical `B=4, H=12, M=N=2048, D=64` workload from
+[`scripts/workload.py`](../scripts/workload.py) and random seed 0.
 
 ## Benchmarks
 
@@ -75,43 +66,35 @@ implementations are timed in randomized, interleaved order.
 Benchmark every registered implementation:
 
 ```bash
-python benchmark.py all
+python -m scripts.benchmark all
 ```
 
 Or benchmark one implementation:
 
 ```bash
-python benchmark.py v5
+python -m scripts.benchmark v5
 ```
 
 Benchmark the dtype-matched FP16 PyTorch reference with:
 
 ```bash
-python benchmark.py sdpa-fp16
+python -m scripts.benchmark sdpa-fp16
 ```
 
 The required implementation argument accepts `all`, `baseline`, `sdpa`,
 `sdpa-fp16`, `v0` through `v6`, and `v4-fp16`.
 
-The shape and timing counts can be overridden for larger, shorter benchmark
-runs:
+Only sequence lengths can be overridden; `B`, `H`, `D`, and the timing
+methodology remain fixed:
 
 ```bash
-python benchmark.py v5 \
-  --batch-size 1 \
-  --num-heads 32 \
-  --head-dim 64 \
-  --seq-lens 4096 \
-  --warmup 5 \
-  --warmup-ms 500 \
-  --repetitions 10 \
-  --samples 7
+python -m scripts.benchmark v5 --seq-lens 4096
 ```
 
 ## Profiling
 
 Use `profile.sh` for detailed inspection of one fused CUDA kernel. Use
-`roofline.py` for the combined application-level comparison, including the
+`scripts.roofline` for the combined application-level comparison, including the
 multi-kernel PyTorch and SDPA references. V0 is excluded from both comparisons
 because it launches multiple project kernels.
 
@@ -189,18 +172,18 @@ when the larger report is needed.
 
 ### Application roofline
 
-Collect all required reports and generate `roofline-data.json` and
-`roofline.png`:
+Collect all required reports and generate `docs/assets/roofline-data.json` and
+`docs/assets/roofline.png`:
 
 ```bash
-python roofline.py --profile
+python -m scripts.roofline --profile
 ```
 
 Regenerate from existing reports, or refresh only selected implementations:
 
 ```bash
-python roofline.py
-python roofline.py --profile --implementations v5
+python -m scripts.roofline
+python -m scripts.roofline --profile --implementations v5
 ```
 
 The collector measures only elapsed time and DRAM bytes. Every point uses the

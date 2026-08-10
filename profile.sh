@@ -76,7 +76,7 @@ profile_implementation() {
     --nvtx-include "flash_attention.${implementation}/" \
     --export "$report" \
     --force-overwrite \
-    "$python_bin" profile_cuda.py "$implementation"
+    "$python_bin" -m scripts.profile_cuda "$implementation"
   echo "Report: ${report}.ncu-rep"
 }
 

@@ -9,21 +9,11 @@ import argparse
 
 import torch
 
-from benchmark import FP16_IMPLEMENTATIONS, IMPLEMENTATIONS, make_inputs
+from scripts.benchmark import IMPLEMENTATIONS, make_inputs
+from scripts.implementations import FP16_IMPLEMENTATIONS
+from scripts.workload import PRIMARY_SEQ_LEN
 
-SEQ_LEN = 2048
-PROFILE_IMPLEMENTATIONS = (
-    "baseline",
-    "sdpa",
-    "sdpa-fp16",
-    "v1",
-    "v2",
-    "v3",
-    "v4",
-    "v4-fp16",
-    "v5",
-    "v6",
-)
+PROFILE_IMPLEMENTATIONS = tuple(name for name in IMPLEMENTATIONS if name != "v0")
 
 
 def main():
@@ -34,7 +24,7 @@ def main():
     forward = IMPLEMENTATIONS[implementation]
     dtype = torch.float16 if implementation in FP16_IMPLEMENTATIONS else torch.float32
     torch.manual_seed(0)
-    q, k, v = make_inputs(SEQ_LEN, dtype=dtype)
+    q, k, v = make_inputs(PRIMARY_SEQ_LEN, dtype=dtype)
 
     # Warm up before entering the range selected by the profiler.
     forward(q, k, v)

@@ -1,8 +1,6 @@
 """Compare CUDA attention implementations with an FP32 PyTorch reference."""
 
 import argparse
-from collections.abc import Callable
-from dataclasses import dataclass
 
 import torch
 
@@ -10,34 +8,23 @@ import flash_attention_v4
 import flash_attention_v4_fp16
 import flash_attention_v5
 import flash_attention_v6
+from scripts.implementations import FP16_IMPLEMENTATIONS
+from scripts.workload import (
+    BATCH_SIZE,
+    HEAD_DIM,
+    NUM_HEADS,
+    PRIMARY_SEQ_LEN,
+)
 from src.baseline import forward as reference_forward
 
 
-BATCH_SIZE = 4
-NUM_HEADS = 12
-QUERY_SEQ_LEN = 2048
-KV_SEQ_LEN = 2048
-HEAD_DIM = 64
-SEED = 0
-
-
-@dataclass(frozen=True)
-class Implementation:
-    forward: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
-    input_dtype: torch.dtype
-
-
 IMPLEMENTATIONS = {
-    "sdpa": Implementation(
-        torch.nn.functional.scaled_dot_product_attention, torch.float32
-    ),
-    "sdpa-fp16": Implementation(
-        torch.nn.functional.scaled_dot_product_attention, torch.float16
-    ),
-    "v4": Implementation(flash_attention_v4.forward_unchecked, torch.float32),
-    "v4-fp16": Implementation(flash_attention_v4_fp16.forward_unchecked, torch.float16),
-    "v5": Implementation(flash_attention_v5.forward_unchecked, torch.float16),
-    "v6": Implementation(flash_attention_v6.forward_unchecked, torch.float16),
+    "sdpa": torch.nn.functional.scaled_dot_product_attention,
+    "sdpa-fp16": torch.nn.functional.scaled_dot_product_attention,
+    "v4": flash_attention_v4.forward_unchecked,
+    "v4-fp16": flash_attention_v4_fp16.forward_unchecked,
+    "v5": flash_attention_v5.forward_unchecked,
+    "v6": flash_attention_v6.forward_unchecked,
 }
 
 
@@ -60,37 +47,20 @@ def calculate_metrics(output: torch.Tensor, reference: torch.Tensor) -> tuple[fl
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("implementations", choices=IMPLEMENTATIONS, nargs="*")
-    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
-    parser.add_argument("--num-heads", type=int, default=NUM_HEADS)
-    parser.add_argument("--query-seq-len", type=int, default=QUERY_SEQ_LEN)
-    parser.add_argument("--kv-seq-len", type=int, default=KV_SEQ_LEN)
-    parser.add_argument("--head-dim", type=int, default=HEAD_DIM)
-    parser.add_argument("--seed", type=int, default=SEED)
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         raise RuntimeError("A CUDA-enabled PyTorch installation and GPU are required.")
 
-    torch.manual_seed(args.seed)
+    torch.manual_seed(0)
     torch.set_float32_matmul_precision("highest")
-    q_shape = (
-        args.batch_size,
-        args.num_heads,
-        args.query_seq_len,
-        args.head_dim,
-    )
-    kv_shape = (
-        args.batch_size,
-        args.num_heads,
-        args.kv_seq_len,
-        args.head_dim,
-    )
+    shape = (BATCH_SIZE, NUM_HEADS, PRIMARY_SEQ_LEN, HEAD_DIM)
 
     # Generate FP16 values first, then promote those exact values for FP32 runs.
     # This measures kernel/output precision without including initial input quantization.
-    q_fp16 = torch.randn(q_shape, device="cuda", dtype=torch.float16)
-    k_fp16 = torch.randn(kv_shape, device="cuda", dtype=torch.float16)
-    v_fp16 = torch.randn_like(k_fp16)
+    q_fp16 = torch.randn(shape, device="cuda", dtype=torch.float16)
+    k_fp16 = torch.randn_like(q_fp16)
+    v_fp16 = torch.randn_like(q_fp16)
     q_fp32, k_fp32, v_fp32 = q_fp16.float(), k_fp16.float(), v_fp16.float()
 
     with torch.inference_mode():
@@ -100,18 +70,20 @@ def main() -> None:
         print("| --- | --- | --- | ---: | ---: | ---: | ---: |")
         implementation_names = args.implementations or IMPLEMENTATIONS
         for name in implementation_names:
-            implementation = IMPLEMENTATIONS[name]
+            input_dtype = (
+                torch.float16 if name in FP16_IMPLEMENTATIONS else torch.float32
+            )
             inputs = (
                 (q_fp16, k_fp16, v_fp16)
-                if implementation.input_dtype == torch.float16
+                if input_dtype == torch.float16
                 else (q_fp32, k_fp32, v_fp32)
             )
-            output = implementation.forward(*inputs)
+            output = IMPLEMENTATIONS[name](*inputs)
             max_abs, mean_abs, rmse, relative_l2 = calculate_metrics(output, reference)
-            input_dtype = str(implementation.input_dtype).removeprefix("torch.")
+            input_dtype_name = str(input_dtype).removeprefix("torch.")
             output_dtype = str(output.dtype).removeprefix("torch.")
             print(
-                f"| {name} | {input_dtype} | {output_dtype} | {max_abs:.3e} | "
+                f"| {name} | {input_dtype_name} | {output_dtype} | {max_abs:.3e} | "
                 f"{mean_abs:.3e} | {rmse:.3e} | {relative_l2:.3e} |"
             )
 
