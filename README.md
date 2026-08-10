@@ -1,18 +1,18 @@
 # FlashAttention-2
 
-Pedagogical project implementing multi-head attention forward passes with CUDA kernels.
+Pedagogical CUDA implementations of multi-head attention forward passes.
 
 ## Usage
 
 ```python
 import torch
-import flash_attention_v5
+import flash_attention_v6
 
 q = torch.randn(2, 3, 32, 64, device="cuda", dtype=torch.float16)
 k = torch.randn_like(q)
 v = torch.randn_like(q)
 
-out = flash_attention_v5.forward(q, k, v)
+out = flash_attention_v6.forward(q, k, v)
 ```
 
 ## Build, test, and profile
@@ -22,44 +22,52 @@ benchmarks, and Nsight Compute profiling.
 
 ## Results
 
-SDPA means scaled dot-product attention and refers here to PyTorch's
-`torch.nn.functional.scaled_dot_product_attention` implementation.
+SDPA refers to PyTorch's
+`torch.nn.functional.scaled_dot_product_attention`. For FP32 at the primary
+shape, it dispatches to fused CUTLASS memory-efficient attention because its
+FlashAttention backend requires FP16 or BF16 inputs in this environment.
 
-Primary shape: `B=4, H=12, M=N=2048, D=64` (all implementations are non-causal).
-Every latency in the implementation table uses the same benchmark protocol: 25
-warmups followed by 50 timed calls. The updated V5 latency is the median of
-seven independent samples using that protocol.
+All benchmarks use `B=4`, `H=12`, `D=64`, `M=N`, and non-causal attention.
+Each value is the median of seven randomized, interleaved samples of 50 calls,
+after at least 25 warmup calls and 500 ms of completed GPU work per
+implementation. The primary shape used for accuracy and profiling is
+`M=N=2048`. The measurements below used a GeForce RTX 4080, driver 595.84,
+PyTorch 2.12.1, and CUDA 13.0.
 
 ### Roofline
 
-![Roofline comparison of all implementations](roofline.png)
+![Roofline comparison of profiled implementations](roofline.png)
 
-Every point uses the same algorithmic work divided by the complete
-attention call's Nsight Compute duration and measured DRAM traffic. V4 FP16
-uses the FP32 ceiling because it has FP16 storage but scalar FP32 arithmetic.
+Every point divides the same algorithmic work by the complete call's Nsight
+Compute duration and measured DRAM traffic. V4 FP16 uses the FP32 ceiling
+because only its storage is FP16.
 
-### Implementations
+### Benchmarks
 
+| Implementation | Dtype | 512 (µs) | 1024 (µs) | 2048 (µs) | Main change |
+| --- | --- | ---: | ---: | ---: | --- |
+| Baseline | FP32 | 472.58 | 2311.85 | 9155.29 | Explicit PyTorch attention |
+| SDPA | FP32 | 311.42 | 1031.48 | 3970.91 | Optimized PyTorch reference |
+| SDPA FP16 | FP16 | 52.06 | 162.69 | 598.11 | Dtype-matched optimized reference |
+| V0 | FP32 | 3276.19 | 11817.45 | 35640.18 | Unfused CUDA kernels |
+| V1 | FP32 | 11669.24 | 45614.24 | 184094.51 | Fused FlashAttention-1 tiling |
+| V2 | FP32 | 7513.74 | 26634.99 | 102911.43 | Query-tile parallelism |
+| V3 | FP32 | 460.41 | 1609.84 | 6212.01 | Warp-local register state |
+| V4 | FP32 | 311.39 | 1014.80 | 3896.21 | Vectorized copies, padding, and 32-bit indexing |
+| V4 FP16 | FP16 | 323.26 | 1116.17 | 4316.33 | Scalar FP16-storage baseline |
+| V5 | FP16 | 144.07 | 507.37 | 1911.97 | Tensor-core WMMA for QK and PV |
+| V6 | FP16 | 124.08 | 458.42 | 1696.97 | Faster exponential and warp reductions |
 
+V0-V4 use FP32. V4 FP16 is the like-for-like scalar baseline for the FP16 V5
+and V6 kernels; the SDPA rows are external references. V6 is the fastest
+project kernel at every measured size. Relative to V5, it is 13.9%, 9.6%, and
+11.2% faster at sequence lengths 512, 1024, and 2048. At 2048 it is 60.7%
+faster than V4 FP16, while FP16 SDPA remains 64.8% faster than V6.
 
-| Version | Title | Dtype | Latency (µs) | Δ vs. baseline | Description |
-| --- | --- | --- | ---: | ---: | --- |
-| Baseline | Naive PyTorch | FP32 | 9566.19 | — | Explicit PyTorch attention used as the correctness and latency reference |
-| SDPA | PyTorch SDPA | FP32 | 4133.99 | −56.8% | Optimized PyTorch reference with automatic CUDA backend selection |
-| SDPA FP16 | PyTorch SDPA | FP16 | 620.32 | −93.5% | Dtype-matched PyTorch reference with automatic CUDA backend selection |
-| V0 | Naive CUDA | FP32 | 35748.39 | +273.7% | Unfused CUDA kernels that materialize the attention matrix |
-| V1 | FlashAttention-1 | FP32 | 191148.32 | +1898.2% | Fused tiled online softmax with one block per batch and head |
-| V2 | Simplified FlashAttention-2 | FP32 | 107191.30 | +1020.5% | FA2-style query-tile parallelism, but most state still lives in shared memory |
-| V3 | Warp-local FlashAttention-2 | FP32 | 6476.57 | −32.3% | V2 with warp-owned softmax/output state, register-blocked QK and PV, and reused K/V shared storage |
-| V4 | Optimized V3 | FP32 | 4111.20 | −57.0% | V3 with vectorized copies, forced inlining, padded shared K rows, and selective 32-bit indexing |
-| V4 FP16 | FP16 storage baseline | FP16 | 4514.22 | −52.8% | V4's scalar matmuls with FP16 storage and FP32 accumulation |
-| V5 | Tensor-core WMMA | FP16 | 2204.73 | −77.0% | WMMA QK and PV with FP32 accumulation and padded operand/result shared rows |
-
-At `M=N=2048`, V5 is the fastest project implementation in this table. It was
-2,309.49 µs, or 51.2%, faster than the same-dtype V4 FP16 storage baseline. V5
-was 1,929.26 µs, or 46.7%, faster than FP32 SDPA. The dtype-matched FP16 SDPA
-reference was fastest overall at 620.32 µs, 1,584.41 µs, or 71.9%, faster than
-V5.
+For cross-dtype context at 2048, V6's 1,696.97 µs latency is 56.4% lower than
+the fastest project FP32 kernel, V4 at 3,896.21 µs, and 57.3% lower than FP32
+SDPA at 3,970.91 µs. These comparisons include V6's FP16 storage and Tensor
+Core advantage; V4 FP16 remains the like-for-like scalar project baseline.
 
 ### Accuracy
 
@@ -69,124 +77,69 @@ V5.
 | SDPA FP16 | FP16 | FP16 | 1.098e-4 | 7.882e-6 | 1.027e-5 | 2.826e-4 |
 | V4 FP16 | FP16 | FP16 | 1.098e-4 | 7.862e-6 | 1.025e-5 | 2.819e-4 |
 | V5 | FP16 | FP16 | 1.098e-4 | 7.862e-6 | 1.025e-5 | 2.819e-4 |
+| V6 | FP16 | FP16 | 1.098e-4 | 7.862e-6 | 1.025e-5 | 2.819e-4 |
 
-`python accuracy.py sdpa sdpa-fp16 v4-fp16 v5` produced these against the
-FP32 PyTorch reference at the primary shape with seed 0. Inputs are generated
-in FP16, then promoted without changing their values for the FP32 reference
-and FP32 SDPA.
+`python accuracy.py sdpa sdpa-fp16 v4-fp16 v5 v6` produced these against the FP32
+PyTorch reference at the primary shape with seed 0. FP32 runs use the exact
+FP16-generated inputs promoted to FP32.
 
-V0–V4 accept contiguous CUDA `float32` tensors. V4 FP16 and V5 accept and return
-`float16`. The benchmark's FP16 SDPA reference also uses `float16`. V0 requires
-self-attention with `M = N`. V1–V5, including V4 FP16,
-accept Q `[B, H, M, D]` and K/V `[B, H, N, D]`. V3 and V4 specialize their CUDA
-kernels for `D=64` and redirect other head dimensions to V2. V4 FP16 and V5
-support only `D=64` and reject unsupported inputs rather than falling back.
+V0–V4 use contiguous CUDA `float32`. V4 FP16, V5, V6, and FP16
+SDPA use `float16`. V0 requires `M=N`. V1–V6 accept Q `[B, H, M, D]` and K/V
+`[B, H, N, D]`. V3 and V4 redirect head dimensions other than `D=64` to V2,
+while V4 FP16, V5, and V6 reject them.
 
-## Notes
+## Profiling notes
 
-`torch.cuda.get_device_properties(0)`
-```
-  maxThreadsPerMultiProcessor = 1,536
-  maximum warps/SM = 1,536 / 32 = 48
-```
+The fused kernels were profiled with Nsight Compute on an original RTX 4080 at
+`B=4`, `H=12`, `M=N=2048`, and `D=64`. These are representative profiler runs,
+not the standalone benchmark timings above.
+Baseline has no project kernel, V0's kernels use 8–37 registers each, and SDPA
+is external, so none has a single project-kernel profile below.
 
-The fused kernels were profiled on an original RTX 4080 using the primary
-benchmark shape. Baseline has no project CUDA kernel. V0 launches several
-kernels that use 8–37 registers per thread, so it does not have one register
-count or occupancy result. SDPA is an external PyTorch reference, so it is not
-included in the project-kernel profiling tables.
-
-The shared-memory bank-conflict ratios below are the number of bank conflicts
-divided by the total load or store wavefronts. They are not the percentage of
-shared-memory instructions that encounter a conflict.
-
-Compute throughput and arithmetic intensity follow each implementation's actual
-compute path: scalar FP32 for V1 through V4 FP16 and dense FP16 Tensor Core
-operations with FP32 accumulation for V5.
+| Kernel | Compute path | Duration (ms) | Registers/thread | Dynamic shared (KB/block) | Achieved occupancy |
+| --- | --- | ---: | ---: | ---: | ---: |
+| V1 | Scalar FP32 | 190.56 | 40 | 37.38 | 8.34% |
+| V2 | Scalar FP32 | 107.29 | 40 | 58.37 | 8.33% |
+| V3 | Scalar FP32 | 6.55 | 80 | 32.77 | 48.33% |
+| V4 | Scalar FP32 | 4.11 | 80 | 32.90 | 48.25% |
+| V4 FP16 | Scalar FP32 | 4.53 | 72 | 16.51 | 48.23% |
+| V5 | FP16 Tensor Core | 2.05 | 64 | 27.14 | 48.31% |
+| V6 | FP16 Tensor Core | 1.84 | 64 | 27.14 | 48.02% |
 
 ### V1: FlashAttention-1
 
-Profiling
-| Metric | Value | Interpretation |
-| --- | ---: | --- |
-| Profiled duration | 190.56 ms | Nsight Compute measurement |
-| Compute-path throughput | 0.336 TFLOP/s | scalar FP32; 0.7% of its roofline peak |
-| Hardware arithmetic intensity | 41.54 FLOP/byte | Hardware-executed compute-path operations per measured DRAM byte |
-| DRAM bandwidth | 8.10 GB/s | Measured device-memory traffic |
-| Occupancy | 8.34% achieved | 16.67% theoretical |
-| Theoretical blocks/SM | 2 | Limited by shared memory |
-| Registers | 40/thread | — |
-| Shared memory | 38.40 KB/block | 37.38 KB dynamic |
-| Shared-load bank-conflict ratio | 87.86% | Above Nsight's 10% warning threshold |
-| Shared-store bank-conflict ratio | 0.00% | No measured conflicts |
-
-V1 follows the basic FA1 idea. It avoids the full attention matrix and extra
-transposes, and it uses warp reductions for softmax. Its biggest problem is the
-grid. It launches one block per `(batch, head)`, which gives us only 48 blocks
-for this benchmark. The RTX 4080 has 76 SMs, so some of them never get any work.
-
-Shared memory also limits how many blocks can run on each SM. The kernel could
-reach eight active warps per SM in theory, but I measured only four. With so few
-active warps, the SM has little other work available while instructions or
-memory accesses are waiting, resulting in poor latency hiding. The next step is
-to split the work into independent query tiles like FA2 instead of trying to
-tune a launch with only 48 blocks.
+V1 follows FA1, avoiding the full attention matrix and using warp reductions
+for softmax. Its one block per `(batch, head)` yields only 48 blocks on a
+76-SM GPU. The RTX 4080 supports 48 warps per SM. Shared memory caps V1 at eight
+theoretical warps per SM, or 16.67% occupancy, but its small grid achieves only
+four warps per SM, or 8.34%. This leaves too little work to hide latency. V2
+fixes the grid by splitting queries into independent tiles.
 
 ### V2: Simplified FlashAttention-2
 
-Profiling
-| Metric | Value | Interpretation |
-| --- | ---: | --- |
-| Profiled duration | 107.29 ms | Nsight Compute measurement |
-| Compute-path throughput | 0.562 TFLOP/s | scalar FP32; 1.2% of its roofline peak |
-| Hardware arithmetic intensity | 62.03 FLOP/byte | Hardware-executed compute-path operations per measured DRAM byte |
-| DRAM bandwidth | 9.07 GB/s | Measured device-memory traffic |
-| Occupancy | 8.33% achieved | 8.33% theoretical |
-| Theoretical blocks/SM | 1 | Limited by shared memory |
-| Registers | 40/thread | — |
-| Shared memory | 59.39 KB/block | 58.37 KB dynamic |
-| Shared-load bank-conflict ratio | 88.05% | Above Nsight's 10% warning threshold |
-| Shared-store bank-conflict ratio | 0.00% | No measured conflicts |
-
-V2 adds FA2-style query tiles and gives each warp complete score rows. That
-raises the grid from 48 blocks to 1,536, so there is plenty of work for every SM.
-Unfortunately, despite this better grid organization, per-SM occupancy remains
-low because V2 still keeps `m`, `l`, `O`, and the temporary softmax state in
-shared memory along with the Q/K/V and S/P tiles.
-
-That adds up to 58.37 KB of dynamic shared memory per block, or 59.39 KB after
-including the driver's 1.02 KB reservation. As a result, each SM can hold only
-one 128-thread block, or four resident warps. Theoretical occupancy is 8.33%,
-closely matching the measured 8.35%. The clear next step is to move the running
-softmax state and output into registers and reuse the shared buffers.
+V2 adds FA2-style query tiles and complete score rows per warp, raising the grid
+from 48 to 1,536 blocks. It still stores `m`, `l`, `O`, temporary softmax state,
+and all tiles in shared memory. The resulting 59.39 KB total allocation (58.37
+KB dynamic) permits only one 128-thread block, or four warps, per SM. V3 moves
+running state into registers and reuses shared buffers.
 
 ### V3: Warp-local FlashAttention-2
 
-Profiling
-| Metric | Value | Interpretation |
-| --- | ---: | --- |
-| Profiled duration | 6.55 ms | Nsight Compute measurement |
-| Compute-path throughput | 8.856 TFLOP/s | scalar FP32; 18.3% of its roofline peak |
-| Hardware arithmetic intensity | 352.90 FLOP/byte | Hardware-executed compute-path operations per measured DRAM byte |
-| DRAM bandwidth | 25.10 GB/s | Measured device-memory traffic |
-| Occupancy | 48.33% achieved | 50.00% theoretical |
-| Theoretical blocks/SM | 3 | Limited by registers, shared memory |
-| Registers | 80/thread | — |
-| Shared memory | 33.79 KB/block | 32.77 KB dynamic |
-| Shared-load bank-conflict ratio | 46.67% | Above Nsight's 10% warning threshold |
-| Shared-store bank-conflict ratio | 2.61% | Below Nsight's 10% warning threshold |
+Shared-memory conflicts are reported as conflicts divided by load or store
+wavefronts, not as the percentage of instructions that conflict.
 
-V3 uses `D=64` because it makes the warp-local state easy to express with
-fixed-size per-thread arrays that the compiler can keep in registers. Other head
-dimensions fall back to V2. Each block has 8 warps, and each warp owns 8
-query and output rows. Warp shuffles copy the running maximum and denominator
-across the lanes. Each lane keeps its own output columns in registers.
+| Metric | V3 | V4 |
+| --- | ---: | ---: |
+| Shared-load bank conflicts / wavefronts | 46.67% | <0.01% |
 
-Unlike V2, V3 does not need shared memory for `m_i`, `l_i`, or the unnormalized
-`O_i`. Each warp keeps that state in per-thread registers. Only Q and the
-unnormalized P tile stay in shared memory, while K and V take turns using the
-same shared tile. This cuts shared memory from 58.37 KB in V2 to 32.77 KB. With
-`B_r=64`, `B_c=32`, and `D=64`, the calculation is:
+V3 specializes `D=64`, using fixed-size arrays the compiler can keep in
+registers, and falls back to V2 otherwise. Each of eight warps owns eight query
+and output rows. Shuffles replicate softmax state across lanes, while each lane
+keeps its output columns in registers.
+
+Q and unnormalized P have dedicated shared storage, while K and V reuse one
+tile. Keeping `m_i`, `l_i`, and unnormalized `O_i` in registers cuts dynamic
+shared memory from 58.37 to 32.77 KB. For `B_r=64`, `B_c=32`, and `D=64`:
 
 ```text
 sQ:    64 × 64 = 4,096 floats
@@ -196,81 +149,40 @@ total: 8,192 floats × 4 bytes = 32,768 bytes
 ```
 
 V3 doubles V2's block size from 128 to 256 threads while keeping `B_r=64`.
-The fixed 33.79 KB shared allocation already limits each SM to three blocks,
-and reducing the threads/block would not shrink that allocation. Using 256
-threads therefore fills otherwise-unused thread capacity without reducing
-block residency (`3 × 256 = 768` of 1,536 threads/SM). Eight warps own 8 rows
-each instead of four warps owning 16, raising resident warps from 12 to 24 and
-giving 50% theoretical occupancy (`24 / (1,536 / 32) = 50%`).
+The 33.79 KB allocation limits each SM to three blocks regardless of block
+size. Using 256 threads fills otherwise-unused capacity without reducing block
+residency (`3 × 256 = 768` of 1,536 threads/SM). This raises resident warps from
+12 to 24.
 
 ### V4: Optimized V3
 
-Profiling
-| Metric | Value | Interpretation |
-| --- | ---: | --- |
-| Profiled duration | 4.11 ms | Nsight Compute measurement |
-| Compute-path throughput | 14.113 TFLOP/s | scalar FP32; 29.0% of its roofline peak |
-| Hardware arithmetic intensity | 372.67 FLOP/byte | Hardware-executed compute-path operations per measured DRAM byte |
-| DRAM bandwidth | 37.87 GB/s | Measured device-memory traffic |
-| Occupancy | 48.25% achieved | 50.00% theoretical |
-| Theoretical blocks/SM | 3 | Limited by registers, shared memory |
-| Registers | 80/thread | — |
-| Shared memory | 33.92 KB/block | 32.90 KB dynamic |
-| Shared-load bank-conflict ratio | <0.01% | Below Nsight's 10% warning threshold |
-| Shared-store bank-conflict ratio | 29.40% | Above Nsight's 10% warning threshold |
+V4 keeps V3's algorithm and warp mapping but adds lower-level CUDA
+optimizations. In the benchmark above, these changes cut latency from 6,212.01
+to 3,896.21 µs, or 37.3%.
 
-V4 keeps the same algorithm and warp mapping as V3. It just adds a few
-lower-level CUDA optimizations. Under the standardized benchmark, they cut
-latency from 6,476.57 µs to 4,111.20 µs, which saves 2,365.37 µs or 36.5%.
+The tuning measurements below predate the standardized protocol and are
+comparable only within this sequence.
 
-The profiled duration was collected under Nsight Compute and is distinct from
-the standalone timing benchmark.
+Forcing every loop to unroll raised register use from 80 to 91 per thread and
+reduced residency from three blocks per SM to two.
 
-The step-by-step measurements below were recorded during V4 development before
-the benchmark protocol was standardized. They show the effect of each change
-within that tuning run and should not be compared directly with the main table.
+Aligned Q/K/V vector copies cut latency from 7,778.20 to 7,243.62 µs, or 6.9%.
 
-Trying to force every loop to unroll made things worse. Register use went from
-80 to 91 per thread, so only two blocks could fit on each SM instead of three.
+Padding shared K rows from 64 to 65 floats prevents QK reads from repeatedly
+hitting one bank. It cut latency from 7,243.62 to 5,393.84 µs, or 25.5%, while
+adding 128 bytes of dynamic shared memory.
 
-Using aligned vector copies for Q, K, and V cut latency from 7,778.20 µs to
-7,243.62 µs. That saved 534.58 µs or 6.9%.
-
-I also pad each shared K row from 64 to 65 floats. This stops the QK reads from
-hitting the same shared-memory bank and cut latency from 7,243.62 µs to
-5,393.84 µs. That saved another 1,849.78 µs or 25.5%. The padding adds 32
-floats, increasing dynamic shared memory from 32,768 to 32,896 bytes.
-
-Using `int` selectively for bounded tile, row, warp, lane, and loop indices
-provided another substantial gain while retaining `std::size_t` for global
-memory offsets. The benchmark measured 3,810.30 µs with
-selective 32-bit indexing, saving another 1,583.54 µs or 29.4%. The 32-bit
-indices avoid unnecessary 64-bit integer arithmetic in the kernel's hot loops,
-while the explicitly widened global offsets can still address the complete
-tensors.
+Selective 32-bit indexing cut latency to 3,810.30 µs, another 29.4%, by avoiding
+64-bit arithmetic in hot loops. Global offsets widen explicitly to
+`std::size_t`.
 
 V5 takes the next architectural step by moving both QK and PV to FP16 WMMA while
 keeping their accumulations, online softmax, and running output in FP32.
 
 ### V4 FP16: FP16 storage baseline
 
-V4 FP16 keeps V4's scalar algorithm as a storage baseline for tensor cores. Q,
-K, V, shared P, and the output use FP16; scores, softmax, and accumulations stay
-FP32.
-
-Profiling
-| Metric | Value | Interpretation |
-| --- | ---: | --- |
-| Profiled duration | 4.53 ms | Nsight Compute measurement |
-| Compute-path throughput | 12.825 TFLOP/s | scalar FP32; 26.3% of its roofline peak |
-| Hardware arithmetic intensity | 858.23 FLOP/byte | Hardware-executed compute-path operations per measured DRAM byte |
-| DRAM bandwidth | 14.94 GB/s | Measured device-memory traffic |
-| Occupancy | 48.23% achieved | 50.00% theoretical |
-| Theoretical blocks/SM | 3 | Limited by registers |
-| Registers | 72/thread | — |
-| Shared memory | 17.54 KB/block | 16.51 KB dynamic |
-| Shared-load bank-conflict ratio | <0.01% | Below Nsight's 10% warning threshold |
-| Shared-store bank-conflict ratio | 2.74% | Below Nsight's 10% warning threshold |
+V4 FP16 is a storage baseline for tensor cores. Q, K, V, shared P, and output
+use FP16. Scores, softmax, and accumulations remain FP32.
 
 Accuracy
 | Implementation | Max abs | Mean abs | RMSE | Relative L2 |
@@ -278,18 +190,14 @@ Accuracy
 | V4 FP32 | 9.239e-7 | 2.928e-8 | 4.201e-8 | 1.156e-6 |
 | V4 FP16 | 1.098e-4 | 7.862e-6 | 1.025e-5 | 2.819e-4 |
 
-`python accuracy.py` produced these against the FP32 PyTorch reference at
-`B=4, H=12, M=N=2048, D=64` with seed 0. The FP32 reference and V4 receive the
-same FP16 inputs promoted to FP32, so the comparison excludes initial input
-rounding. Max error captures the worst element, mean error captures typical
-error, RMSE weights larger errors more, and relative L2 normalizes total error
-by the reference magnitude. These are measurements, not error bounds.
+`python accuracy.py` produced these against the FP32 PyTorch reference at the
+primary shape with seed 0. V4 and the reference receive the same FP16 inputs
+promoted to FP32, excluding initial rounding. These measurements are not error
+bounds.
 
-V4 FP16 took 4,514.22 µs versus V4's 4,111.20 µs, so it was 9.8% slower.
-V4 is already compute-bound, and V4 FP16 still performs scalar FP32 `FFMA`s
-after converting FP16 operands inside QK and PV. The smaller shared allocation
-does not improve residency: 72 registers per thread still limit both versions
-to three blocks per SM and 50% theoretical occupancy.
+V4 FP16 took 4,316.33 µs, 10.8% slower than V4. It still converts operands
+before scalar FP32 `FFMA`s, and its smaller shared allocation does not improve
+residency. Registers still limit both versions to three blocks per SM.
 
 The final SASS confirmed three `LDG.E.128` Q/K/V loads and explicit
 `HADD2.F32`/`F2F` conversions. This shows that the conversions exist, not that
@@ -302,67 +210,71 @@ cuobjdump --dump-sass flash_attention_v4_fp16*.so \
 
 ### V5: Tensor-core WMMA
 
-Profiling
+Shared-memory profiling
 | Metric | Value | Interpretation |
 | --- | ---: | --- |
-| Profiled duration | 2.05 ms | Nsight Compute measurement |
-| Compute-path throughput | 25.202 TFLOP/s | dense FP16 Tensor Core with FP32 accumulation; 25.9% of its roofline peak |
-| Hardware arithmetic intensity | 944.42 FLOP/byte | Hardware-executed compute-path operations per measured DRAM byte |
-| DRAM bandwidth | 26.68 GB/s | Measured device-memory traffic |
-| Occupancy | 48.31% achieved | 50.00% theoretical |
-| Theoretical blocks/SM | 3 | Limited by shared memory |
-| Registers | 64/thread | — |
-| Shared memory | 28.16 KB/block | 27.14 KB dynamic |
-| Shared-load bank-conflict ratio | 34.92% | Above Nsight's 10% warning threshold |
-| Shared-store bank-conflict ratio | 2.27% | Below Nsight's 10% warning threshold |
-| Tensor-pipe active cycles | 12.96% | Both QK and PV execute on Tensor Cores |
+| Shared-load bank conflicts / wavefronts | 34.92% | Operand loads remain conflicted |
+| Shared-store bank conflicts / wavefronts | 2.27% | Scratch padding kept result stores low |
+| Short-scoreboard stall | 6.28 cycles/issued instruction | 45.0% of the 13.94-cycle average warp latency |
+
+The Short Scoreboard and bank-conflict measurements are consistent with
+shared-memory operand loads being V5's main remaining memory-side stall.
 
 Accuracy
-| Max abs | Mean abs | RMSE | Relative L2 |
-| ---: | ---: | ---: | ---: |
-| 1.098e-4 | 7.862e-6 | 1.025e-5 | 2.819e-4 |
+| Implementation | Max abs | Mean abs | RMSE | Relative L2 |
+| --- | ---: | ---: | ---: | ---: |
+| SDPA FP16 | 1.098e-4 | 7.882e-6 | 1.027e-5 | 2.826e-4 |
+| V5 | 1.098e-4 | 7.862e-6 | 1.025e-5 | 2.819e-4 |
 
+`python accuracy.py sdpa-fp16 v5` produced these against the FP32 PyTorch
+reference at the primary shape with seed 0. Both receive the same FP16 inputs,
+return FP16 outputs, and have effectively equivalent measured accuracy.
 
-V5 builds on V4 FP16 and uses FP16 WMMA operands and FP32 accumulators for both
-matrix products. Each warp computes Q @ K as
+V5 uses FP16 WMMA operands and FP32 accumulators for both matrix products. Each
+warp computes Q @ K as
 `[8,64] @ [64,32]` and P @ V as `[8,32] @ [32,64]` using `m8n32k16` operations.
 Softmax and the running output remain FP32 and register-resident.
 
-WMMA hides its lane-to-accumulator mapping, so V5 stores each warp's `[8,32]`
-QK score or PV contribution in its region of the FP32 shared `sS_ij` buffer
-before lanes reload their columns. The result remains logically `[8,32]`, but
-its physical row stride is 36 floats. Padding the original 32-float stride by
-four shifts consecutive rows across four shared-memory banks. It reduced the
-shared-store bank-conflict ratio from 64.46% to 2.04% and the fixed-clock
-profiled duration from 2.29 ms to 2.12 ms, or 7.4%, while adding 1.02 KB of
-dynamic shared memory without changing three-block residency.
+Because WMMA hides its accumulator mapping, each warp materializes its
+`[8,32]` QK or PV result in FP32 shared `sS_ij` before lanes reload their
+columns. Padding its row stride from 32 to 36 floats shifts rows across banks,
+cutting store conflicts from 64.46% to 2.04% and fixed-clock duration from 2.29
+to 2.12 ms, or 7.4%. It adds 1.02 KB without changing residency.
 
-Shared P also remains logically 32 columns wide but uses a physical row stride
-of 40 halves. Compared with the result-padded kernel, adding eight halves per P
-row reduced shared-load bank conflicts from 62.94 million to 44.06 million, or
-30.0%, and fixed-clock profiled duration from 2.12 ms to 2.05 ms, or 3.7%. It
-adds another 1.03 KB of dynamic shared memory without changing residency.
+Shared P uses a physical row stride of 40 halves for 32 logical columns. Its
+eight-half padding cut load conflicts from 62.94 to 44.06 million, or 30.0%,
+and duration from 2.12 to 2.05 ms, or 3.7%. It adds 1.03 KB without changing
+residency.
 
-This P padding is specific to V5's WMMA access pattern. In the scalar V3/V4 PV
-loop, every lane reads the same P element at each key-row step, so shared memory
-broadcasts the value without a conflict. WMMA instead distributes a P matrix
-fragment across lanes through `LDSM` loads, making the physical row stride part
-of the bank mapping. V3/V4 also keep their scalar matrix-product results in
-known per-lane registers, so they do not need V5's shared WMMA-result buffer.
+This padding is specific to WMMA. Scalar V3/V4 broadcast one P element across
+lanes, while WMMA distributes fragments through `LDSM` loads whose bank mapping
+depends on the physical stride. V3/V4 also keep matrix-product results in known
+per-lane registers and need no shared result buffer.
 
-K and V share a separate padded allocation with stride
-`HEAD_DIM + 8 = 72`.
-The eight-half padding is the smallest WMMA-compatible increment and shifts
-consecutive rows by four shared-memory banks, reducing but not eliminating the
-K/V `LDSM` load conflicts. Shared-load conflicts therefore remain at 34.92%.
+K and V share a padded allocation with stride `HEAD_DIM + 8 = 72`. This
+smallest WMMA-compatible increment shifts rows by four banks but leaves 34.92%
+shared-load conflicts.
 
-Next steps:
+### V6: Cheaper scalar operations
 
-- Reuse shared-memory allocations to target four resident blocks per SM.
-- Use raw `mma.sync` PTX to keep MMA results in registers and avoid the
-  `sS_ij` shared-memory round trip.
-- Use swizzled shared layouts to reduce the K/V `LDSM` bank conflicts that
-  remain after row padding.
+V6 retains V5's WMMA and memory layout, but replaces `expf` with `__expf` and
+uses XOR warp reductions that need no final broadcast.
+
+| Metric | V5 | V6 |
+| --- | ---: | ---: |
+| Profiled duration | 2.05 ms | 1.84 ms |
+| Short Scoreboard | 6.28 cycles/issued instruction | 5.06 cycles/issued instruction |
+| Shared-load bank conflicts / wavefronts | 34.92% | 34.90% |
+
+The nearly identical shared-load result is expected because V6 does not change
+V5's operand layout. Its improvement comes from cheaper scalar work around the
+same WMMA operations.
+
+Experiments with asynchronous staging, explicit fragment pipelines, deferred
+output scaling, independent PV accumulators, and four-block residency either
+regressed or added substantial complexity for small gains. The synchronous
+64-register version was retained; [the V6 extended notes](docs/v6-extended-notes.md)
+summarize those measurements.
 
 ## Extended notes
 
@@ -371,6 +283,7 @@ Next steps:
 - [V3 extended notes](docs/v3-extended-notes.md)
 - [V4 FP16 extended notes](docs/v4-fp16-extended-notes.md)
 - [V5 extended notes](docs/v5-extended-notes.md)
+- [V6 extended notes](docs/v6-extended-notes.md)
 
 ## Sources
 
