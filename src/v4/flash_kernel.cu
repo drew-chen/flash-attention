@@ -1,7 +1,7 @@
 #include "../cuda_utils.h"
+#include <array>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -119,8 +119,7 @@ __device__ __forceinline__ std::size_t get_tile_offset(const int H,
                                                        const int tile_idx) {
     const int batch_idx = static_cast<int>(blockIdx.x);
     const int head_idx = static_cast<int>(blockIdx.y);
-    const int row_offset =
-        (((batch_idx * H) + head_idx) * total_rows) + (tile_idx * tile_rows);
+    const int row_offset = (((batch_idx * H) + head_idx) * total_rows) + (tile_idx * tile_rows);
     return static_cast<std::size_t>(row_offset) * HEAD_DIM;
 }
 
@@ -143,8 +142,7 @@ __device__ void load_shared_tile_vectorized(float *const smem_ptr,
     constexpr int VECTORS_PER_ROW = HEAD_DIM / VECTOR_WIDTH;
     const int vectors_per_tile = tile_rows * VECTORS_PER_ROW;
     const int global_tile_start_row = tile_i * tile_rows;
-    const std::size_t global_tile_offset =
-        get_tile_offset(H, total_rows, tile_rows, tile_i);
+    const std::size_t global_tile_offset = get_tile_offset(H, total_rows, tile_rows, tile_i);
     const auto *const global_vectors =
         reinterpret_cast<const float4 *>(gmem_ptr + global_tile_offset);
 
@@ -232,12 +230,11 @@ template <ReductionOp Op> __device__ __forceinline__ float warp_allreduce(float 
  *
  * with shape [WARP_TILE_ROWS, D] @ [D, B_c] = [WARP_TILE_ROWS, B_c].
  */
-__device__ __forceinline__ std::array<float, WARP_TILE_ROWS>
-score_ij(const float *const sQ_i,
-         const float *const sK_j,
-         const int row_start,
-         const int lane,
-         const bool key_valid) {
+__device__ __forceinline__ std::array<float, WARP_TILE_ROWS> score_ij(const float *const sQ_i,
+                                                                      const float *const sK_j,
+                                                                      const int row_start,
+                                                                      const int lane,
+                                                                      const bool key_valid) {
     std::array<float, WARP_TILE_ROWS> wS_ij{};
     if (!key_valid) {
         return wS_ij;
@@ -270,7 +267,8 @@ __device__ __forceinline__ void online_softmax_ij(float *const sP_ij_unnormalize
                                                   float (&wM_i_replicated)[WARP_TILE_ROWS],
                                                   float (&wL_i_replicated)[WARP_TILE_ROWS],
                                                   float (&wO_i_left_unnormalized)[WARP_TILE_ROWS],
-                                                  float (&wO_i_right_unnormalized)[WARP_TILE_ROWS]) {
+                                                  float (&wO_i_right_unnormalized)
+                                                      [WARP_TILE_ROWS]) {
     for (int warp_row = 0; warp_row < WARP_TILE_ROWS; ++warp_row) {
         const int row = row_start + warp_row;
         const bool query_valid = query_start + row < M;
@@ -281,14 +279,12 @@ __device__ __forceinline__ void online_softmax_ij(float *const sP_ij_unnormalize
         // Each lane contributes its score against sK_j[lane, :] for this owned
         // Q row. The reductions broadcast the row result back to every lane.
         const float key_tile_row_max = warp_allreduce<ReductionOp::MAX>(score);
-        const float m_new =
-            query_valid ? fmaxf(wM_i_replicated[warp_row], key_tile_row_max) : 0.0F;
+        const float m_new = query_valid ? fmaxf(wM_i_replicated[warp_row], key_tile_row_max) : 0.0F;
         const float p_value = query_valid && key_valid ? expf(score - m_new) : 0.0F;
         const float key_tile_row_sum = warp_allreduce<ReductionOp::SUM>(p_value);
         const float old_scale = query_valid ? expf(wM_i_replicated[warp_row] - m_new) : 0.0F;
 
-        wL_i_replicated[warp_row] =
-            (old_scale * wL_i_replicated[warp_row]) + key_tile_row_sum;
+        wL_i_replicated[warp_row] = (old_scale * wL_i_replicated[warp_row]) + key_tile_row_sum;
         wO_i_left_unnormalized[warp_row] *= old_scale;
         wO_i_right_unnormalized[warp_row] *= old_scale;
         wM_i_replicated[warp_row] = m_new;
@@ -305,13 +301,14 @@ __device__ __forceinline__ void online_softmax_ij(float *const sP_ij_unnormalize
  *
  * with shape [WARP_TILE_ROWS, B_c] @ [B_c, D] = [WARP_TILE_ROWS, D].
  */
-__device__ __forceinline__ void accumulate_PV_into_O_i(
-    const float *const sP_ij_unnormalized,
-    const float *const sV_j,
-    const int row_start,
-    const int lane,
-    float (&wO_i_left_unnormalized)[WARP_TILE_ROWS],
-    float (&wO_i_right_unnormalized)[WARP_TILE_ROWS]) {
+__device__ __forceinline__ void accumulate_PV_into_wO_i(const float *const sP_ij_unnormalized,
+                                                        const float *const sV_j,
+                                                        const int row_start,
+                                                        const int lane,
+                                                        float (&wO_i_left_unnormalized)
+                                                            [WARP_TILE_ROWS],
+                                                        float (&wO_i_right_unnormalized)
+                                                            [WARP_TILE_ROWS]) {
     for (int key_row = 0; key_row < B_c; ++key_row) {
         const float value_left = sV_j[(key_row * HEAD_DIM) + lane];
         const float value_right = sV_j[(key_row * HEAD_DIM) + lane + WARP_SIZE];
@@ -405,8 +402,7 @@ __global__ void forward_d64(FlashForwardKernelParams p) {
         const bool key_valid = (key_tile * B_c) + lane < p.N;
         // For every Q row owned by this warp, wS_ij stores this lane's score
         // against sK_j[lane, :].
-        auto wS_ij =
-            score_ij(sQ_i, sK_j, row_start, lane, key_valid);
+        auto wS_ij = score_ij(sQ_i, sK_j, row_start, lane, key_valid);
         online_softmax_ij(sP_ij_unnormalized, p.M, query_start, row_start, lane, key_valid, wS_ij,
                           wM_i_replicated, wL_i_replicated, wO_i_left_unnormalized,
                           wO_i_right_unnormalized);
@@ -416,8 +412,8 @@ __global__ void forward_d64(FlashForwardKernelParams p) {
         float *const sV_j = load_V_j(p, smem, key_tile);
         __syncthreads();
 
-        accumulate_PV_into_O_i(sP_ij_unnormalized, sV_j, row_start, lane,
-                               wO_i_left_unnormalized, wO_i_right_unnormalized);
+        accumulate_PV_into_wO_i(sP_ij_unnormalized, sV_j, row_start, lane, wO_i_left_unnormalized,
+                                wO_i_right_unnormalized);
         // Finish reading sV_j before the next sK_j reuses its shared storage.
         __syncthreads();
     }

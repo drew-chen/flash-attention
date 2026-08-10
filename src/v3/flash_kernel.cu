@@ -87,8 +87,7 @@ __device__ std::size_t get_tile_offset(const std::size_t H,
                                        const std::size_t tile_idx) {
     const std::size_t batch_idx = static_cast<std::size_t>(blockIdx.x);
     const std::size_t head_idx = static_cast<std::size_t>(blockIdx.y);
-    const std::size_t batch_head_offset =
-        ((batch_idx * H) + head_idx) * total_rows * total_cols;
+    const std::size_t batch_head_offset = ((batch_idx * H) + head_idx) * total_rows * total_cols;
     return batch_head_offset + (tile_idx * tile_rows * total_cols);
 }
 
@@ -248,8 +247,7 @@ __device__ void online_softmax_ij(float *const sP_ij_unnormalized,
         // The reductions produce this Q row's max and sum for the current K
         // tile, then broadcast each result back to every lane.
         const float key_tile_row_max = warp_allreduce<ReductionOp::MAX>(wS_ij[warp_row]);
-        const float m_new =
-            query_valid ? fmaxf(wM_i_replicated[warp_row], key_tile_row_max) : 0.0F;
+        const float m_new = query_valid ? fmaxf(wM_i_replicated[warp_row], key_tile_row_max) : 0.0F;
         const float p_value = query_valid && key_valid ? expf(wS_ij[warp_row] - m_new) : 0.0F;
         const float key_tile_row_sum = warp_allreduce<ReductionOp::SUM>(p_value);
         const float old_scale = query_valid ? expf(wM_i_replicated[warp_row] - m_new) : 0.0F;
@@ -271,13 +269,12 @@ __device__ void online_softmax_ij(float *const sP_ij_unnormalized,
  *
  * with shape [WARP_TILE_ROWS, B_c] @ [B_c, D] = [WARP_TILE_ROWS, D].
  */
-__device__ void accumulate_PV_into_O_i(
-    const float *const sP_ij_unnormalized,
-    const float *const sV_j,
-    const std::size_t row_start,
-    const std::size_t lane,
-    float (&wO_i_left_unnormalized)[WARP_TILE_ROWS],
-    float (&wO_i_right_unnormalized)[WARP_TILE_ROWS]) {
+__device__ void accumulate_PV_into_wO_i(const float *const sP_ij_unnormalized,
+                                        const float *const sV_j,
+                                        const std::size_t row_start,
+                                        const std::size_t lane,
+                                        float (&wO_i_left_unnormalized)[WARP_TILE_ROWS],
+                                        float (&wO_i_right_unnormalized)[WARP_TILE_ROWS]) {
     for (std::size_t key_row = 0; key_row < B_c; ++key_row) {
         // Each lane computes two output columns so all 32 lanes span D=64.
         const float value_left = sV_j[(key_row * HEAD_DIM) + lane];
@@ -377,8 +374,8 @@ __global__ void forward_d64(FlashForwardKernelParams p) {
         float *const sV_j = load_V_j(p, smem, key_tile);
         __syncthreads();
 
-        accumulate_PV_into_O_i(sP_ij_unnormalized, sV_j, row_start, lane,
-                               wO_i_left_unnormalized, wO_i_right_unnormalized);
+        accumulate_PV_into_wO_i(sP_ij_unnormalized, sV_j, row_start, lane, wO_i_left_unnormalized,
+                                wO_i_right_unnormalized);
         // Finish reading sV_j before the next sK_j reuses its shared storage.
         __syncthreads();
     }

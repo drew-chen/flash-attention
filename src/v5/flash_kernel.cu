@@ -124,8 +124,7 @@ __device__ __forceinline__ std::size_t get_tile_offset(const int H,
                                                        const int tile_idx) {
     const int batch_idx = static_cast<int>(blockIdx.x);
     const int head_idx = static_cast<int>(blockIdx.y);
-    const int row_offset =
-        (((batch_idx * H) + head_idx) * total_rows) + (tile_idx * tile_rows);
+    const int row_offset = (((batch_idx * H) + head_idx) * total_rows) + (tile_idx * tile_rows);
     return static_cast<std::size_t>(row_offset) * HEAD_DIM;
 }
 
@@ -146,8 +145,7 @@ __device__ void load_shared_tile_vectorized(half *const smem_ptr,
     constexpr int VECTORS_PER_ROW = HEAD_DIM / VECTOR_WIDTH;
     const int vectors_per_tile = tile_rows * VECTORS_PER_ROW;
     const int global_tile_start_row = tile_i * tile_rows;
-    const std::size_t global_tile_offset =
-        get_tile_offset(H, total_rows, tile_rows, tile_i);
+    const std::size_t global_tile_offset = get_tile_offset(H, total_rows, tile_rows, tile_i);
     const auto *const global_vectors =
         reinterpret_cast<const Half8 *>(gmem_ptr + global_tile_offset);
 
@@ -341,15 +339,15 @@ __device__ __forceinline__ void online_softmax_ij(half *const sP_ij_unnormalized
  *
  * with shape [WARP_TILE_ROWS, B_c] @ [B_c, D] = [WARP_TILE_ROWS, D].
  */
-__device__ __forceinline__ void accumulate_PV_into_O_i(const half *const sP_ij_unnormalized,
-                                                       const half *const sV_j,
-                                                       float *const sS_ij,
-                                                       const int row_start,
-                                                       const int lane,
-                                                       float (&wO_i_left_unnormalized)
-                                                           [WARP_TILE_ROWS],
-                                                       float (&wO_i_right_unnormalized)
-                                                           [WARP_TILE_ROWS]) {
+__device__ __forceinline__ void accumulate_PV_into_wO_i(const half *const sP_ij_unnormalized,
+                                                        const half *const sV_j,
+                                                        float *const sS_ij,
+                                                        const int row_start,
+                                                        const int lane,
+                                                        float (&wO_i_left_unnormalized)
+                                                            [WARP_TILE_ROWS],
+                                                        float (&wO_i_right_unnormalized)
+                                                            [WARP_TILE_ROWS]) {
     static_assert(WMMA_M == WARP_TILE_ROWS);
     static_assert(WMMA_N == WARP_SIZE);
     static_assert(B_c % WMMA_K == 0);
@@ -504,8 +502,8 @@ __global__ void forward_d64(FlashForwardKernelParams p) {
         half *const sV_j = load_V_j(p, smem, key_tile);
         __syncthreads();
 
-        accumulate_PV_into_O_i(sP_ij_unnormalized, sV_j, sS_ij, row_start, lane,
-                               wO_i_left_unnormalized, wO_i_right_unnormalized);
+        accumulate_PV_into_wO_i(sP_ij_unnormalized, sV_j, sS_ij, row_start, lane,
+                                wO_i_left_unnormalized, wO_i_right_unnormalized);
         // Finish reading sV_j before the next sK_j reuses its shared storage.
         __syncthreads();
     }
